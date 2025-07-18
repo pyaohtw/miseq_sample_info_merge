@@ -16,10 +16,7 @@ st.title("🔗 MiSeq Excel Merger")
 # --- DEFAULT PREFIX ---
 today = datetime.date.today()
 default_prefix = f"run{today.year % 100:02d}{today.month:02d}{today.day:02d}mi"
-prefix = st.text_input(
-    "Filename prefix (defaults to today’s run timestamp)",
-    value=default_prefix
-)
+prefix = st.text_input("Filename prefix (defaults to today’s run timestamp)", value=default_prefix)
 out_excel = f"{prefix}_sample_info.xlsx"
 out_csv = f"{prefix}_miseq.csv"
 
@@ -27,33 +24,25 @@ out_csv = f"{prefix}_miseq.csv"
 state = st.session_state
 if "upload_key" not in state:
     state.upload_key = 0
-for key in ("expanded_df", "raw_df", "log_rows", "file_combos", "cross_dup_combos"):
+for key in ("expanded_df","raw_df","log_rows","file_combos","cross_dup_combos"): 
     if key not in state:
         state[key] = None
 
 # --- MERGE & CLEAR BUTTONS ---
-col1, col2, _ = st.columns([1, 1, 4])
+col1, col2, _ = st.columns([1,1,4])
 with col1:
     merge_clicked = st.button("▶️ Merge")
 with col2:
     if st.button("🗑️ Clear uploads"):
         state.upload_key += 1
-        state.expanded_df = None
-        state.raw_df = None
-        state.log_rows = None
-        state.file_combos = None
-        state.cross_dup_combos = None
+        for key in ("expanded_df","raw_df","log_rows","file_combos","cross_dup_combos"): 
+            state[key] = None
 
 st.markdown("---")
 
 # --- FILE UPLOADER ---
 uploader_key = f"uploads_{state.upload_key}"
-uploaded_files = st.file_uploader(
-    "Upload one or more .xlsx files",
-    type=["xlsx"],
-    accept_multiple_files=True,
-    key=uploader_key
-)
+uploaded_files = st.file_uploader("Upload one or more .xlsx files", type=["xlsx"], accept_multiple_files=True, key=uploader_key)
 
 # --- HELPER: EXPAND BLANK gRNA ---
 def expand_gRNA(df):
@@ -78,83 +67,83 @@ if merge_clicked:
         raw_list, exp_list, logs = [], [], []
         file_combos = {}
         for f in uploaded_files:
-            df = pd.read_excel(f, sheet_name=SHEET_NAME, engine='openpyxl')
+            # attempt to read Data sheet
+            try:
+                df = pd.read_excel(f, sheet_name=SHEET_NAME, engine='openpyxl')
+                sheet_found = True
+            except ValueError:
+                # log missing sheet and skip
+                logs.append({
+                    'File': f.name,
+                    'Sheet Found': False,
+                    'Input Samples': 0,
+                    'Blank gRNA': 0,
+                    'gRNA Entries Added': 0,
+                    'In-file Dup Combos': 0,
+                    'Cross-file Dup': False
+                })
+                continue
+            # proceed with QC and merge
             # filter rows by CORE_COLS
             mask = df[CORE_COLS].notna().all(axis=1)
             for col in CORE_COLS:
                 mask &= ~df[col].astype(str).isin(BAD_VALUES)
             df_filtered = df[mask].copy()
             raw_list.append(df_filtered)
-
             # track index combos per file
-            combos = set(tuple(x) for x in df_filtered[['index', 'index2']].dropna().apply(tuple, axis=1))
+            combos = set(tuple(x) for x in df_filtered[['index','index2']].dropna().apply(tuple, axis=1))
             file_combos[f.name] = combos
-
             # in-file duplicate combos count
-            dup_counts = df_filtered.groupby(['index', 'index2']).size()
-            in_dup_count = sum(1 for count in dup_counts.values if count > 1)
-
+            dup_counts = df_filtered.groupby(['index','index2']).size()
+            in_dup_count = sum(1 for c in dup_counts.values if c > 1)
             # expand for Excel
             df_expanded, blank_count, filled_count = expand_gRNA(df_filtered)
             exp_list.append(df_expanded)
-
+            # add log entry
             logs.append({
                 'File': f.name,
+                'Sheet Found': True,
                 'Input Samples': len(df_filtered),
                 'Blank gRNA': blank_count,
                 'gRNA Entries Added': filled_count,
-                'In-file Dup Combos': in_dup_count
+                'In-file Dup Combos': in_dup_count,
+                'Cross-file Dup': False  # annotate later
             })
-
         # cross-file duplicate detection
         combo_files_map = {}
         for fname, combos in file_combos.items():
             for combo in combos:
                 combo_files_map.setdefault(combo, []).append(fname)
-        cross_dup_combos = {c: fs for c, fs in combo_files_map.items() if len(fs) > 1}
-
-        # annotate cross-file duplication in logs
-        for log in logs:
-            fname = log['File']
-            log['Cross-file Dup'] = any(fname in fs for fs in cross_dup_combos.values())
-
-        # store merged data and logs
-        state.raw_df = pd.concat(raw_list, ignore_index=True)
-        state.expanded_df = pd.concat(exp_list, ignore_index=True)
+        cross_dup = {c: fs for c,fs in combo_files_map.items() if len(fs)>1}
+        # mark cross-file dup
+        for entry in logs:
+            entry['Cross-file Dup'] = any(entry['File'] in fs for fs in cross_dup.values())
+        # store data and logs
+        state.raw_df = pd.concat(raw_list, ignore_index=True) if raw_list else pd.DataFrame()
+        state.expanded_df = pd.concat(exp_list, ignore_index=True) if exp_list else pd.DataFrame()
         log_df = pd.DataFrame(logs)
-        totals = {
-            'File': 'Total',
-            'Input Samples': int(log_df['Input Samples'].sum()),
-            'Blank gRNA': int(log_df['Blank gRNA'].sum()),
-            'gRNA Entries Added': int(log_df['gRNA Entries Added'].sum()),
-            'In-file Dup Combos': int(log_df['In-file Dup Combos'].sum()),
-            'Cross-file Dup': ''
-        }
+        totals = {col: ('' if col=='File' or col=='Sheet Found' else int(log_df[col].sum())) for col in log_df.columns}
+        totals['File'] = 'Total'
+        totals['Sheet Found'] = ''
         state.log_rows = pd.concat([log_df, pd.DataFrame([totals])], ignore_index=True)
         state.file_combos = file_combos
-        state.cross_dup_combos = cross_dup_combos
+        state.cross_dup_combos = cross_dup
 
 # --- DISPLAY RESULTS & DOWNLOADS ---
-if state.log_rows is not None and state.raw_df is not None:
+if state.log_rows is not None:
     st.subheader('Merge Log')
     st.table(state.log_rows)
     if state.cross_dup_combos:
-        combos_str = ', '.join(f"{c[0]}/{c[1]}" for c in state.cross_dup_combos)
+        combos_str = ', '.join(f"{i}/{j}" for i,j in state.cross_dup_combos)
         st.warning(f"Cross-file duplicate index combos across files: {combos_str}")
-
-    # Excel download (expanded)
+    # Excel download
     excel_buf = BytesIO()
-    with pd.ExcelWriter(excel_buf, engine='openpyxl') as writer:
-        state.expanded_df.to_excel(writer, index=False, sheet_name=SHEET_NAME)
+    with pd.ExcelWriter(excel_buf, engine='openpyxl') as w:
+        state.expanded_df.to_excel(w, index=False, sheet_name=SHEET_NAME)
     excel_buf.seek(0)
-    st.download_button(
-        '📥 Download merged Excel',
-        data=excel_buf,
-        file_name=out_excel,
-        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
-
-    # CSV download (raw, unexpanded)
+    st.download_button('📥 Download merged Excel', data=excel_buf, file_name=out_excel,
+                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    # CSV download
     csv_buf = StringIO()
     csv_buf.write('[Header]\n')
     csv_buf.write(f'Experiment Name,{prefix}\n')
@@ -163,22 +152,14 @@ if state.log_rows is not None and state.raw_df is not None:
     csv_buf.write('[Reads]\n300\n')
     csv_buf.write('[Settings]\n')
     csv_buf.write('[Data]\n')
-    csv_buf.write('Sample_ID,Sample_Name,I7_Index_ID,index,I5_Index_ID,index2,Sample_Project,Description\n')
-    for _, row in state.raw_df.iterrows():
+    csv_buf.write('Sample_ID,Sample_Name,I7_Index_ID,index,I5_INDEX_ID,index2,Sample_Project,Description\n')
+    for _,row in state.raw_df.iterrows():
         csv_buf.write(
-            f"{row['Sample_ID']},,"  # blank Sample_Name
-            f"{row['I7_Index_ID']},{row['index']}"
+            f"{row['Sample_ID']},,{row['I7_Index_ID']},{row['index']}"
             f",{row['I5_Index_ID']},{row['index2']},,\n"
         )
     data_c = csv_buf.getvalue().encode('utf-8')
-    st.download_button(
-        '📥 Download Miseq CSV',
-        data=data_c,
-        file_name=out_csv,
-        mime='text/csv'
-    )
-
-    # Preview
+    st.download_button('📥 Download Miseq CSV', data=data_c, file_name=out_csv, mime='text/csv')
     st.subheader('Merged Data Preview')
     st.dataframe(state.expanded_df, use_container_width=True)
 else:
