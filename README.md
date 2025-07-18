@@ -1,7 +1,3 @@
-Here’s a draft **README.md** you can drop into your GitHub repo to document the app:
-
----
-
 # MiSeq Sample Info Merger
 
 A Streamlit-based utility to:
