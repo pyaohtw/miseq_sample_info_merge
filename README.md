@@ -94,10 +94,4 @@ streamlit run app.py
    * **Excel**: all fields plus filled-in `gRNA` expansions.
    * **CSV**: minimal columns for MiSeq, preserving only the original (pre-expanded) rows.
 
-## License
 
-MIT © Your Name / Your Organization
-
----
-
-Feel free to adjust any section, add screenshots, or link to issue trackers as needed!
