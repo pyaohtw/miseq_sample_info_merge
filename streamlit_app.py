@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO, StringIO
 import datetime
+import pytz
 
 # --- CONFIGURATION ---
 SHEET_NAME = "Data"
@@ -14,7 +15,8 @@ st.set_page_config(page_title="MiSeq Excel Merger", layout="wide")
 st.title("🔗 MiSeq Excel Merger")
 
 # --- DEFAULT PREFIX ---
-today = datetime.date.today()
+pst = pytz.timezone("America/Los_Angeles")
+today = datetime.datetime.now(pst).date()
 default_prefix = f"run{today.year % 100:02d}{today.month:02d}{today.day:02d}mi"
 prefix = st.text_input("Filename prefix (defaults to today’s run timestamp)", value=default_prefix)
 out_excel = f"{prefix}_sample_info.xlsx"
