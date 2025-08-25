@@ -4,6 +4,7 @@ import pandas as pd
 from io import BytesIO, StringIO
 import datetime
 import pytz
+import re
 
 # --- CONFIGURATION ---
 SHEET_NAME = "Data"
@@ -26,7 +27,9 @@ out_csv = f"{prefix}_miseq.csv"
 state = st.session_state
 if "upload_key" not in state:
     state.upload_key = 0
-for key in ("expanded_df","raw_df","log_rows","file_combos","cross_dup_combos"): 
+for key in ("expanded_df","raw_df","log_rows","file_combos","cross_dup_combos",
+            # === NEW: keep per-merge gRNA QC tallies ===
+            "grna_qc_logs", "grna_qc_totals"):
     if key not in state:
         state[key] = None
 
@@ -37,7 +40,8 @@ with col1:
 with col2:
     if st.button("🗑️ Clear uploads"):
         state.upload_key += 1
-        for key in ("expanded_df","raw_df","log_rows","file_combos","cross_dup_combos"): 
+        for key in ("expanded_df","raw_df","log_rows","file_combos","cross_dup_combos",
+                    "grna_qc_logs","grna_qc_totals"):
             state[key] = None
 
 st.markdown("---")
@@ -45,6 +49,52 @@ st.markdown("---")
 # --- FILE UPLOADER ---
 uploader_key = f"uploads_{state.upload_key}"
 uploaded_files = st.file_uploader("Upload one or more .xlsx files", type=["xlsx"], accept_multiple_files=True, key=uploader_key)
+
+# === NEW: gRNA normalization & QC helpers ===
+_GRNA_VALID_RE = re.compile(r"^[ATCG]*$")
+
+def _normalize_grna_val(val):
+    """
+    Convert a single gRNA value to uppercase string, replace U->T,
+    preserve NaN/blank as blank string for QC consistency.
+    """
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    if s == "":
+        return ""
+    s = s.upper().replace("U", "T")
+    return s
+
+def clean_and_qc_grna(df: pd.DataFrame):
+    """
+    Returns (df_cleaned, qc_dict)
+    - df_cleaned: with gRNA uppercased and U->T applied in-place
+    - qc_dict: counts for U->T conversions and remaining invalid gRNA entries
+    """
+    if "gRNA" not in df.columns:
+        # No gRNA column — skip gracefully
+        return df, {"u_to_t": 0, "invalid_after": 0, "invalid_examples": []}
+
+    grna_orig = df["gRNA"].copy()
+
+    # Count values containing U/u before normalization (non-empty only)
+    contains_u_mask = grna_orig.astype(str).str.contains(r"[Uu]", regex=True, na=False)
+    # Normalize
+    df["gRNA"] = grna_orig.apply(_normalize_grna_val)
+
+    # Count invalid AFTER normalization (i.e., not strictly A/T/C/G)
+    nonempty_mask = df["gRNA"].astype(str).str.len() > 0
+    invalid_mask = nonempty_mask & ~df["gRNA"].astype(str).str.match(_GRNA_VALID_RE)
+    invalid_after_count = int(invalid_mask.sum())
+    invalid_examples = df.loc[invalid_mask, "gRNA"].astype(str).unique().tolist()[:5]
+
+    qc = {
+        "u_to_t": int(contains_u_mask.sum()),
+        "invalid_after": invalid_after_count,
+        "invalid_examples": invalid_examples,
+    }
+    return df, qc
 
 # --- HELPER: EXPAND BLANK gRNA ---
 def expand_gRNA(df):
@@ -68,6 +118,11 @@ if merge_clicked:
     else:
         raw_list, exp_list, logs = [], [], []
         file_combos = {}
+        grna_qc_logs = []     # === NEW
+        total_u_to_t = 0      # === NEW
+        total_invalid = 0     # === NEW
+        total_invalid_examples = set()  # === NEW
+
         for f in uploaded_files:
             # attempt to read Data sheet
             try:
@@ -82,25 +137,46 @@ if merge_clicked:
                     'Blank gRNA': 0,
                     'gRNA Entries Added': 0,
                     'In-file Dup Combos': 0,
-                    'Cross-file Dup': False
+                    'Cross-file Dup': False,
+                    # === NEW: per-file gRNA QC fields
+                    'gRNA U→T': 0,
+                    'Non-ATCG (post U→T)': 0
                 })
                 continue
-            # proceed with QC and merge
+
             # filter rows by CORE_COLS
             mask = df[CORE_COLS].notna().all(axis=1)
             for col in CORE_COLS:
                 mask &= ~df[col].astype(str).isin(BAD_VALUES)
             df_filtered = df[mask].copy()
+
+            # === NEW: normalize & QC gRNA before expansion ===
+            df_filtered, qc = clean_and_qc_grna(df_filtered)
+            total_u_to_t += qc["u_to_t"]
+            total_invalid += qc["invalid_after"]
+            for ex in qc["invalid_examples"]:
+                total_invalid_examples.add(ex)
+            grna_qc_logs.append({
+                "File": f.name,
+                "gRNA U→T": qc["u_to_t"],
+                "Non-ATCG (post U→T)": qc["invalid_after"],
+                "Examples (up to 5)": ", ".join(qc["invalid_examples"]) if qc["invalid_examples"] else ""
+            })
+
             raw_list.append(df_filtered)
+
             # track index combos per file
             combos = set(tuple(x) for x in df_filtered[['index','index2']].dropna().apply(tuple, axis=1))
             file_combos[f.name] = combos
+
             # in-file duplicate combos count
             dup_counts = df_filtered.groupby(['index','index2']).size()
             in_dup_count = sum(1 for c in dup_counts.values if c > 1)
+
             # expand for Excel
             df_expanded, blank_count, filled_count = expand_gRNA(df_filtered)
             exp_list.append(df_expanded)
+
             # add log entry
             logs.append({
                 'File': f.name,
@@ -109,35 +185,76 @@ if merge_clicked:
                 'Blank gRNA': blank_count,
                 'gRNA Entries Added': filled_count,
                 'In-file Dup Combos': in_dup_count,
-                'Cross-file Dup': False  # annotate later
+                'Cross-file Dup': False,  # annotate later
+                # === NEW: include gRNA QC in main log
+                'gRNA U→T': qc["u_to_t"],
+                'Non-ATCG (post U→T)': qc["invalid_after"]
             })
+
         # cross-file duplicate detection
         combo_files_map = {}
         for fname, combos in file_combos.items():
             for combo in combos:
                 combo_files_map.setdefault(combo, []).append(fname)
         cross_dup = {c: fs for c,fs in combo_files_map.items() if len(fs)>1}
+
         # mark cross-file dup
         for entry in logs:
             entry['Cross-file Dup'] = any(entry['File'] in fs for fs in cross_dup.values())
+
         # store data and logs
         state.raw_df = pd.concat(raw_list, ignore_index=True) if raw_list else pd.DataFrame()
         state.expanded_df = pd.concat(exp_list, ignore_index=True) if exp_list else pd.DataFrame()
+
         log_df = pd.DataFrame(logs)
-        totals = {col: ('' if col=='File' or col=='Sheet Found' else int(log_df[col].sum())) for col in log_df.columns}
-        totals['File'] = 'Total'
-        totals['Sheet Found'] = ''
+        # sum numeric cols safely
+        totals = {}
+        for col in log_df.columns:
+            if col in ('File', 'Sheet Found', 'Cross-file Dup'):
+                totals[col] = '' if col != 'File' else 'Total'
+            else:
+                try:
+                    totals[col] = int(pd.to_numeric(log_df[col], errors='coerce').fillna(0).sum())
+                except Exception:
+                    totals[col] = ''
         state.log_rows = pd.concat([log_df, pd.DataFrame([totals])], ignore_index=True)
+
         state.file_combos = file_combos
         state.cross_dup_combos = cross_dup
 
+        # === NEW: save gRNA QC summary for notifications
+        state.grna_qc_logs = pd.DataFrame(grna_qc_logs) if grna_qc_logs else None
+        state.grna_qc_totals = {
+            "u_to_t": total_u_to_t,
+            "invalid_after": total_invalid,
+            "invalid_examples": sorted(list(total_invalid_examples))[:5]
+        }
+
 # --- DISPLAY RESULTS & DOWNLOADS ---
 if state.log_rows is not None:
+    # === NEW: show gRNA QC notifications ===
+    if state.grna_qc_totals:
+        if state.grna_qc_totals["u_to_t"] > 0:
+            st.info(f"gRNA cleanup: Converted **{state.grna_qc_totals['u_to_t']}** entries from U→T (case-insensitive).")
+        if state.grna_qc_totals["invalid_after"] > 0:
+            examples = ", ".join(state.grna_qc_totals["invalid_examples"])
+            msg = f"Found **{state.grna_qc_totals['invalid_after']}** gRNA entr{'y' if state.grna_qc_totals['invalid_after']==1 else 'ies'} containing non-A/T/C/G characters **after** U→T conversion."
+            if examples:
+                msg += f" Examples: {examples}"
+            st.warning(msg)
+
     st.subheader('Merge Log')
     st.table(state.log_rows)
+
+    # === NEW: optional per-file gRNA QC table (collapsed) ===
+    if state.grna_qc_logs is not None and not state.grna_qc_logs.empty:
+        with st.expander("Show per-file gRNA QC details"):
+            st.table(state.grna_qc_logs)
+
     if state.cross_dup_combos:
         combos_str = ', '.join(f"{i}/{j}" for i,j in state.cross_dup_combos)
         st.warning(f"Cross-file duplicate index combos across files: {combos_str}")
+
     # Excel download
     excel_buf = BytesIO()
     with pd.ExcelWriter(excel_buf, engine='openpyxl') as w:
@@ -145,6 +262,7 @@ if state.log_rows is not None:
     excel_buf.seek(0)
     st.download_button('📥 Download merged Excel', data=excel_buf, file_name=out_excel,
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
     # CSV download
     csv_buf = StringIO()
     csv_buf.write('[Header]\n')
@@ -162,8 +280,10 @@ if state.log_rows is not None:
         )
     data_c = csv_buf.getvalue().encode('utf-8')
     st.download_button('📥 Download Miseq CSV', data=data_c, file_name=out_csv, mime='text/csv')
+
     st.subheader('Merged Data Preview')
     st.dataframe(state.expanded_df, use_container_width=True)
+
 else:
     if merge_clicked:
         st.error('No valid rows found.')
