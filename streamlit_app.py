@@ -8,6 +8,7 @@ import re
 
 # --- CONFIGURATION ---
 SHEET_NAME = "Data"
+USER_ID_SHEET = "UserID" # === Define UserID sheet name
 CORE_COLS = ["Sample_ID", "I7_Index_ID", "index", "I5_Index_ID", "index2", "Amplicon"]
 BAD_VALUES = {"#N/A", ""}
 
@@ -28,8 +29,10 @@ state = st.session_state
 if "upload_key" not in state:
     state.upload_key = 0
 for key in ("expanded_df","raw_df","log_rows","file_combos","cross_dup_combos",
-            # === NEW: keep per-merge gRNA QC tallies ===
-            "grna_qc_logs", "grna_qc_totals"):
+            # === keep per-merge gRNA QC tallies ===
+            "grna_qc_logs", "grna_qc_totals",
+            # === User ID storage ===
+            "user_ids"):
     if key not in state:
         state[key] = None
 
@@ -41,7 +44,7 @@ with col2:
     if st.button("🗑️ Clear uploads"):
         state.upload_key += 1
         for key in ("expanded_df","raw_df","log_rows","file_combos","cross_dup_combos",
-                    "grna_qc_logs","grna_qc_totals"):
+                    "grna_qc_logs","grna_qc_totals", "user_ids"):
             state[key] = None
 
 st.markdown("---")
@@ -50,7 +53,7 @@ st.markdown("---")
 uploader_key = f"uploads_{state.upload_key}"
 uploaded_files = st.file_uploader("Upload one or more .xlsx files", type=["xlsx"], accept_multiple_files=True, key=uploader_key)
 
-# === NEW: gRNA normalization & QC helpers ===
+# === gRNA normalization & QC helpers (unchanged) ===
 _GRNA_VALID_RE = re.compile(r"^[ATCG]*$")
 
 def _normalize_grna_val(val):
@@ -96,7 +99,7 @@ def clean_and_qc_grna(df: pd.DataFrame):
     }
     return df, qc
 
-# --- HELPER: EXPAND BLANK gRNA ---
+# --- HELPER: EXPAND BLANK gRNA (unchanged) ---
 def expand_gRNA(df):
     non_blank = df[df['gRNA'].notna() & (df['gRNA'].astype(str).str.strip() != '')].copy()
     blank = df[df['gRNA'].isna() | (df['gRNA'].astype(str).str.strip() == '')].copy()
@@ -118,31 +121,69 @@ if merge_clicked:
     else:
         raw_list, exp_list, logs = [], [], []
         file_combos = {}
-        grna_qc_logs = []     # === NEW
-        total_u_to_t = 0      # === NEW
-        total_invalid = 0     # === NEW
-        total_invalid_examples = set()  # === NEW
+        grna_qc_logs = []
+        total_u_to_t = 0
+        total_invalid = 0
+        total_invalid_examples = set()
+        
+        user_ids = set() 
 
         for f in uploaded_files:
-            # attempt to read Data sheet
+            
+            df_data = None
+            df_user_id = None
+            
+            # 1. Attempt to read Data sheet (REQUIRED)
             try:
-                df = pd.read_excel(f, sheet_name=SHEET_NAME, engine='openpyxl')
-                sheet_found = True
+                df_data = pd.read_excel(f, sheet_name=SHEET_NAME, engine='openpyxl')
             except ValueError:
-                # log missing sheet and skip
+                # Data sheet not found, cannot process this file. Log and skip.
                 logs.append({
                     'File': f.name,
-                    'Sheet Found': False,
+                    'Sheet Found': False, 
                     'Input Samples': 0,
                     'Blank gRNA': 0,
                     'gRNA Entries Added': 0,
                     'In-file Dup Combos': 0,
                     'Cross-file Dup': False,
-                    # === NEW: per-file gRNA QC fields
                     'gRNA U→T': 0,
                     'Non-ATCG (post U→T)': 0
                 })
                 continue
+                
+            # 2. Attempt to read UserID sheet (OPTIONAL, assuming a header is used)
+            try:
+                # === UPDATED: Use default header=0 (first row is header)
+                df_user_id = pd.read_excel(f, sheet_name=USER_ID_SHEET, engine='openpyxl')
+            except ValueError:
+                # UserID sheet not found, that's fine, df_user_id remains None
+                pass
+            
+            # --- PROCESS USERID SHEET ---
+            if df_user_id is not None:
+                
+                # Normalize column names to check against (allowing for "UserID" or "User ID")
+                cols = [str(c).strip().replace('_', ' ') for c in df_user_id.columns]
+                
+                # === UPDATED: Look for a column named 'UserID' or 'User ID'
+                target_col_index = -1
+                if 'UserID'.lower() in [c.lower() for c in cols]:
+                    target_col_index = [c.lower() for c in cols].index('userid')
+                elif 'User ID'.lower() in [c.lower() for c in cols]:
+                    target_col_index = [c.lower() for c in cols].index('user id')
+                
+                if target_col_index != -1:
+                    # Get the actual column name from the original DataFrame
+                    target_col_name = df_user_id.columns[target_col_index]
+                    
+                    if not df_user_id.empty and target_col_name in df_user_id.columns:
+                        # Extract data using the column name, ensuring the header is skipped
+                        current_ids = df_user_id[target_col_name].astype(str).str.strip().dropna()
+                        # Filter out blank IDs and merge
+                        user_ids.update(set(id for id in current_ids if id != ""))
+
+            # --- PROCESS DATA SHEET (unchanged) ---
+            df = df_data 
 
             # filter rows by CORE_COLS
             mask = df[CORE_COLS].notna().all(axis=1)
@@ -150,7 +191,7 @@ if merge_clicked:
                 mask &= ~df[col].astype(str).isin(BAD_VALUES)
             df_filtered = df[mask].copy()
 
-            # === NEW: normalize & QC gRNA before expansion ===
+            # === normalize & QC gRNA before expansion ===
             df_filtered, qc = clean_and_qc_grna(df_filtered)
             total_u_to_t += qc["u_to_t"]
             total_invalid += qc["invalid_after"]
@@ -180,17 +221,17 @@ if merge_clicked:
             # add log entry
             logs.append({
                 'File': f.name,
-                'Sheet Found': True,
+                'Sheet Found': True, 
                 'Input Samples': len(df_filtered),
                 'Blank gRNA': blank_count,
                 'gRNA Entries Added': filled_count,
                 'In-file Dup Combos': in_dup_count,
-                'Cross-file Dup': False,  # annotate later
-                # === NEW: include gRNA QC in main log
+                'Cross-file Dup': False, 
                 'gRNA U→T': qc["u_to_t"],
                 'Non-ATCG (post U→T)': qc["invalid_after"]
             })
 
+        # ... (rest of log and state storage logic remains the same) ...
         # cross-file duplicate detection
         combo_files_map = {}
         for fname, combos in file_combos.items():
@@ -222,17 +263,20 @@ if merge_clicked:
         state.file_combos = file_combos
         state.cross_dup_combos = cross_dup
 
-        # === NEW: save gRNA QC summary for notifications
+        # === save gRNA QC summary for notifications
         state.grna_qc_logs = pd.DataFrame(grna_qc_logs) if grna_qc_logs else None
         state.grna_qc_totals = {
             "u_to_t": total_u_to_t,
             "invalid_after": total_invalid,
             "invalid_examples": sorted(list(total_invalid_examples))[:5]
         }
+        
+        # === save merged User IDs
+        state.user_ids = sorted(list(user_ids))
 
 # --- DISPLAY RESULTS & DOWNLOADS ---
 if state.log_rows is not None:
-    # === NEW: show gRNA QC notifications ===
+    # === show gRNA QC notifications ===
     if state.grna_qc_totals:
         if state.grna_qc_totals["u_to_t"] > 0:
             st.info(f"gRNA cleanup: Converted **{state.grna_qc_totals['u_to_t']}** entries from U→T (case-insensitive).")
@@ -246,10 +290,15 @@ if state.log_rows is not None:
     st.subheader('Merge Log')
     st.table(state.log_rows)
 
-    # === NEW: optional per-file gRNA QC table (collapsed) ===
+    # === optional per-file gRNA QC table (collapsed) ===
     if state.grna_qc_logs is not None and not state.grna_qc_logs.empty:
         with st.expander("Show per-file gRNA QC details"):
             st.table(state.grna_qc_logs)
+            
+    # === show merged User IDs
+    if state.user_ids:
+        user_id_str = ", ".join(state.user_ids)
+        st.info(f"Merged Unique User IDs: {user_id_str}")
 
     if state.cross_dup_combos:
         combos_str = ', '.join(f"{i}/{j}" for i,j in state.cross_dup_combos)
@@ -259,6 +308,18 @@ if state.log_rows is not None:
     excel_buf = BytesIO()
     with pd.ExcelWriter(excel_buf, engine='openpyxl') as w:
         state.expanded_df.to_excel(w, index=False, sheet_name=SHEET_NAME)
+        
+        # === Write UserID sheet
+        if state.user_ids:
+            # Create a DataFrame with a single column 'UserID' for consistent output
+            user_df = pd.DataFrame(
+                {
+                    'UserID': [", ".join(state.user_ids)]
+                }
+            )
+            # Write to Excel with the 'UserID' header
+            user_df.to_excel(w, index=False, sheet_name=USER_ID_SHEET)
+            
     excel_buf.seek(0)
     st.download_button('📥 Download merged Excel', data=excel_buf, file_name=out_excel,
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
