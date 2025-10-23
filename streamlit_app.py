@@ -114,6 +114,37 @@ def expand_gRNA(df):
     df_extra = pd.DataFrame(extras, columns=df.columns) if extras else pd.DataFrame(columns=df.columns)
     return pd.concat([non_blank, df_extra], ignore_index=True), len(blank), len(extras)
 
+# === Final output header + helper to enforce columns/order (CRISPResso) ===
+FINAL_COLS = [
+    "Sample_ID", "Sample_Name", "I7_Index_ID", "index", "I5_Index_ID", "index2",
+    "Sample_Project", "Description", "ELN_ID", "Isoform_Sample_ID", "PAM",
+    "gRNA", "Amplicon", "Exon"
+]
+
+def ensure_columns_and_order(df, columns, core_cols=CORE_COLS):
+    """
+    Guarantee that the final output:
+      1) has ALL columns in `columns` (missing ones added as empty string),
+      2) is ordered exactly as `columns`,
+      3) fills non-core columns with empty string to avoid Excel 'NaN'.
+    """
+    df_out = df.copy()
+
+    # 1) ensure all final columns exist
+    for col in columns:
+        if col not in df_out.columns:
+            df_out[col] = ""
+
+    # 2) order strictly
+    df_out = df_out[columns]
+
+    # 3) ensure non-core cols are printable strings (no NaN in Excel)
+    non_core = [c for c in columns if c not in core_cols]
+    for c in non_core:
+        df_out[c] = df_out[c].fillna("").astype(str)
+
+    return df_out
+
 # --- PERFORM MERGE & QC ---
 if merge_clicked:
     if not uploaded_files:
@@ -274,6 +305,7 @@ if merge_clicked:
         # === save merged User IDs
         state.user_ids = sorted(list(user_ids))
 
+
 # --- DISPLAY RESULTS & DOWNLOADS ---
 if state.log_rows is not None:
     # === show gRNA QC notifications ===
@@ -304,25 +336,51 @@ if state.log_rows is not None:
         combos_str = ', '.join(f"{i}/{j}" for i,j in state.cross_dup_combos)
         st.warning(f"Cross-file duplicate index combos across files: {combos_str}")
 
-    # Excel download
+    #Excel download for CRISPResso (ordered headers incl. Exon) ===
+    from io import BytesIO
+
+    # Build the final, ordered frame for Excel and preview
+    final_df = ensure_columns_and_order(state.expanded_df, FINAL_COLS)
+
+    # Optional: warn if any ORIGINAL rows had empty gRNA (even if later auto-filled)
+    try:
+        if hasattr(state, "raw_df") and "gRNA" in state.raw_df.columns:
+            orig_blank_mask = state.raw_df["gRNA"].isna() | state.raw_df["gRNA"].astype(str).str.strip().eq("")
+            if orig_blank_mask.any():
+                # Show a count and a few identifiers to help the user
+                n_blank = int(orig_blank_mask.sum())
+                # Try to show Sample_IDs (fallback to row indices)
+                id_col = "Sample_ID" if "Sample_ID" in state.raw_df.columns else None
+                examples = (
+                    state.raw_df.loc[orig_blank_mask, id_col].astype(str).head(5).tolist()
+                    if id_col else state.raw_df.index[orig_blank_mask].astype(str).to_series().head(5).tolist()
+                )
+                examples_txt = ", ".join(examples)
+                st.warning(
+                    f"⚠️ {n_blank} row(s) had empty gRNA in the input and were auto-filled "
+                    f"(showing up to 5 examples: {examples_txt}). "
+                )
+    except Exception as _e:
+        # Be quiet if state.raw_df isn't available for any reason
+        pass
+
+    # Write the Excel with strictly ordered headers
     excel_buf = BytesIO()
-    with pd.ExcelWriter(excel_buf, engine='openpyxl') as w:
-        state.expanded_df.to_excel(w, index=False, sheet_name=SHEET_NAME)
-        
-        # === Write UserID sheet
-        if state.user_ids:
-            # Create a DataFrame with a single column 'UserID' for consistent output
-            user_df = pd.DataFrame(
-                {
-                    'UserID': [", ".join(state.user_ids)]
-                }
-            )
-            # Write to Excel with the 'UserID' header
+    with pd.ExcelWriter(excel_buf, engine="openpyxl") as w:
+        final_df.to_excel(w, index=False, sheet_name=SHEET_NAME)
+
+        # If you track user IDs in `state.user_ids`, include a separate sheet
+        if hasattr(state, "user_ids") and state.user_ids:
+            user_df = pd.DataFrame({"UserID": [", ".join(state.user_ids)]})
             user_df.to_excel(w, index=False, sheet_name=USER_ID_SHEET)
-            
-    excel_buf.seek(0)
-    st.download_button('📥 Download merged Excel', data=excel_buf, file_name=out_excel,
-                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    excel_buf.seek(0)    
+    st.download_button(
+        "📥 Download merged Excel (CRISPResso)",
+        data=excel_buf,
+        file_name=out_excel,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     # CSV download
     csv_buf = StringIO()
