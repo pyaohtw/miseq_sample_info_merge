@@ -33,6 +33,7 @@ BASE_EDITING_CONFLICT_COLS = [
 ]
 DNA_ONLY_RE = re.compile(r"^[ATCG]*$")
 DNA_OR_U_RE = re.compile(r"^[ATCGU]*$")
+WELL_SUFFIX_RE = re.compile(r"^(.*?)([A-H](?:[1-9]|1[0-2]))$")
 QC_ANCHOR_COLS = ["Sample_ID", "gRNA", "Amplicon", "Exon", "Expected_HDR_Amplicon", BASE_EDITING_COL]
 QC_OPTIONAL_COLS = [
     "Exon", "Expected_HDR_Amplicon", "Quantification_Window_Coordinates",
@@ -65,8 +66,10 @@ if "upload_key" not in state:
 for key in ("qc_results", "merge_results"):
     if key not in state:
         state[key] = None
+if "merge_sample_id_autocorrect" not in state:
+    state.merge_sample_id_autocorrect = False
 
-col1, col2, _ = st.columns([1, 1, 4])
+col1, col2, col3 = st.columns([1, 1, 4])
 with col1:
     run_clicked = st.button("▶️ Run QC" if mode == "QC Screening" else "▶️ Merge")
 with col2:
@@ -74,6 +77,13 @@ with col2:
         state.upload_key += 1
         state.qc_results = None
         state.merge_results = None
+with col3:
+    if mode == "File Merge":
+        state.merge_sample_id_autocorrect = st.checkbox(
+            "Auto-correct duplicate cleaned Sample_IDs",
+            value=state.merge_sample_id_autocorrect,
+            help="When duplicate Sample_IDs are created after removing non-alphanumeric characters, keep the first ID unchanged and make later duplicates unique. If a well-like suffix such as A1 or H12 is present at the end, the number is inserted before it; otherwise the number is appended at the end.",
+        )
 
 st.markdown("---")
 
@@ -136,6 +146,71 @@ def normalize_grna_for_merge(value) -> str:
 def normalize_base_editing_type(value) -> str:
     s = clean_cell_minimal(value)
     return s.upper() if s else ""
+
+
+def clean_sample_id(value) -> str:
+    s = clean_cell_merge(value)
+    if not s:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]", "", s)
+
+
+def split_well_suffix(sample_id: str):
+    match = WELL_SUFFIX_RE.match(sample_id)
+    if match:
+        return match.group(1), match.group(2)
+    return sample_id, ""
+
+
+def build_sample_id_cleanup_preview(original_ids, cleaned_ids, final_ids):
+    rows = []
+    for orig, cleaned, final in zip(original_ids, cleaned_ids, final_ids):
+        if cleaned and orig != cleaned:
+            rows.append({
+                "Original Sample_ID": orig,
+                "Cleaned Sample_ID": cleaned,
+                "Final Sample_ID": final,
+            })
+    return pd.DataFrame(rows)
+
+
+def resolve_duplicate_sample_ids(cleaned_ids):
+    final_ids = []
+    collision_rows = []
+    seen_final = set()
+    base_occurrence = {}
+
+    for idx, cleaned in enumerate(cleaned_ids):
+        if not cleaned:
+            final_ids.append("")
+            continue
+
+        base_occurrence[cleaned] = base_occurrence.get(cleaned, 0) + 1
+
+        if base_occurrence[cleaned] == 1 and cleaned not in seen_final:
+            final_id = cleaned
+        else:
+            prefix, suffix = split_well_suffix(cleaned)
+            n = max(base_occurrence[cleaned], 2)
+            while True:
+                candidate = f"{prefix}{n}{suffix}" if suffix else f"{cleaned}{n}"
+                if candidate not in seen_final:
+                    final_id = candidate
+                    break
+                n += 1
+            base_occurrence[cleaned] = n
+
+        if final_id != cleaned:
+            collision_rows.append({
+                "Row": idx + 2,
+                "Cleaned Sample_ID": cleaned,
+                "Final Sample_ID": final_id,
+            })
+
+        final_ids.append(final_id)
+        seen_final.add(final_id)
+
+    return final_ids, pd.DataFrame(collision_rows)
 
 
 def reverse_complement(seq: str) -> str:
@@ -241,6 +316,15 @@ def add_issue(issue_rows: list, file_name: str, row_num: str, sample_id: str, se
         "Category": category,
         "Message": message,
     })
+
+
+def format_severity_label(severity: str) -> str:
+    mapping = {
+        "Error": "Error, must fix❗",
+        "Warning": "Warning, review⚠️",
+        "Info": "Info, awarenessℹ️",
+    }
+    return mapping.get(severity, severity)
 
 
 def analyze_duplicates(active_df: pd.DataFrame, file_name: str, issue_rows: list):
@@ -561,10 +645,20 @@ def run_qc(uploaded_files):
 
 def clean_and_qc_grna_merge(df: pd.DataFrame):
     if "gRNA" not in df.columns:
-        return df, {"u_to_t": 0, "invalid_after": 0, "invalid_examples": [], "missing_grna": len(df)}
+        missing_examples = df["Sample_ID"].astype(str).tolist()[:5] if "Sample_ID" in df.columns else []
+        return df, {
+            "u_to_t": 0,
+            "invalid_after": 0,
+            "invalid_examples": [],
+            "missing_grna": len(df),
+            "missing_examples": missing_examples,
+        }
     grna_orig = df["gRNA"].copy()
     contains_u_mask = grna_orig.astype(str).str.contains(r"[Uu]", regex=True, na=False)
     missing_mask = grna_orig.astype(str).str.strip() == ""
+    missing_examples = []
+    if "Sample_ID" in df.columns:
+        missing_examples = df.loc[missing_mask, "Sample_ID"].astype(str).replace("", "(blank Sample_ID)").tolist()[:5]
     df["gRNA"] = grna_orig.apply(normalize_grna_for_merge)
     nonempty_mask = df["gRNA"].astype(str).str.len() > 0
     invalid_mask = nonempty_mask & ~df["gRNA"].astype(str).str.match(DNA_ONLY_RE)
@@ -573,6 +667,7 @@ def clean_and_qc_grna_merge(df: pd.DataFrame):
         "invalid_after": int(invalid_mask.sum()),
         "invalid_examples": df.loc[invalid_mask, "gRNA"].astype(str).unique().tolist()[:5],
         "missing_grna": int(missing_mask.sum()),
+        "missing_examples": missing_examples,
     }
 
 
@@ -661,15 +756,20 @@ def apply_base_editing_rules_merge(df: pd.DataFrame):
     }
 
 
-def run_merge(uploaded_files):
+def run_merge(uploaded_files, auto_correct_sample_ids=False):
     raw_list, exp_list, logs = [], [], []
     file_combos = {}
     grna_qc_logs = []
     base_edit_qc_logs = []
     user_ids = set()
+    sample_id_cleanup_rows = []
+    sample_id_collision_rows = []
+    sample_id_changed_count = 0
+    sample_id_collision_files = []
 
     total_u_to_t = total_invalid = total_missing_grna = 0
     total_invalid_examples = set()
+    total_missing_grna_examples = set()
     total_amp_invalid = total_hdr_invalid = total_grna_not_found = total_base_edit_invalid = total_base_edit_conflict = total_amplicon_reoriented = 0
     total_amp_invalid_examples = set()
     total_hdr_invalid_examples = set()
@@ -708,6 +808,29 @@ def run_merge(uploaded_files):
             mask = df[relevant_cols].apply(lambda r: any(clean_cell_merge(v) != "" for v in r), axis=1)
         df_nonblank = blankify_merge(df[mask].copy())
 
+        original_sample_ids = df_nonblank["Sample_ID"].apply(clean_cell_merge).tolist() if "Sample_ID" in df_nonblank.columns else [""] * len(df_nonblank)
+        cleaned_sample_ids = [clean_sample_id(v) for v in original_sample_ids]
+        final_sample_ids = cleaned_sample_ids[:]
+
+        cleaned_nonblank = [sid for sid in cleaned_sample_ids if sid]
+        if cleaned_nonblank and pd.Series(cleaned_nonblank).duplicated(keep=False).any():
+            sample_id_collision_files.append(file_label)
+
+        if auto_correct_sample_ids:
+            final_sample_ids, collision_df = resolve_duplicate_sample_ids(cleaned_sample_ids)
+            if not collision_df.empty:
+                collision_df.insert(0, "File", file_label)
+                sample_id_collision_rows.extend(collision_df.to_dict("records"))
+
+        cleanup_preview_df = build_sample_id_cleanup_preview(original_sample_ids, cleaned_sample_ids, final_sample_ids)
+        if not cleanup_preview_df.empty:
+            cleanup_preview_df.insert(0, "File", file_label)
+            sample_id_cleanup_rows.extend(cleanup_preview_df.to_dict("records"))
+            sample_id_changed_count += len(cleanup_preview_df)
+
+        if "Sample_ID" in df_nonblank.columns:
+            df_nonblank["Sample_ID"] = final_sample_ids
+
         df_nonblank, qc = clean_and_qc_grna_merge(df_nonblank)
         raw_list.append(df_nonblank)
 
@@ -722,6 +845,7 @@ def run_merge(uploaded_files):
         total_invalid += qc["invalid_after"]
         total_missing_grna += qc["missing_grna"]
         total_invalid_examples.update(qc["invalid_examples"])
+        total_missing_grna_examples.update(qc.get("missing_examples", []))
         total_amp_invalid += qc_be["amp_invalid"]
         total_amp_invalid_examples.update(qc_be["amp_invalid_examples"])
         total_hdr_invalid += qc_be["hdr_invalid"]
@@ -788,6 +912,7 @@ def run_merge(uploaded_files):
         "base_edit_qc_logs": pd.DataFrame(base_edit_qc_logs) if base_edit_qc_logs else pd.DataFrame(),
         "grna_qc_totals": {
             "missing_grna": total_missing_grna,
+            "missing_examples": sorted(list(total_missing_grna_examples))[:5],
             "u_to_t": total_u_to_t,
             "invalid_after": total_invalid,
             "invalid_examples": sorted(list(total_invalid_examples))[:5],
@@ -808,6 +933,11 @@ def run_merge(uploaded_files):
         },
         "cross_dup_combos": cross_dup,
         "user_ids": sorted(user_ids),
+        "sample_id_cleanup_df": pd.DataFrame(sample_id_cleanup_rows),
+        "sample_id_collision_df": pd.DataFrame(sample_id_collision_rows),
+        "sample_id_changed_count": sample_id_changed_count,
+        "sample_id_collision_files": sample_id_collision_files,
+        "sample_id_autocorrect_applied": auto_correct_sample_ids,
     }
 
 
@@ -829,7 +959,16 @@ def render_qc_results(results):
 
     if not results["issues_df"].empty:
         st.subheader("QC Issues")
-        st.dataframe(results["issues_df"], use_container_width=True, hide_index=True)
+        show_non_errors = st.toggle("Show Warnings and Info", value=False)
+        severity_order = {"Error": 0, "Warning": 1, "Info": 2}
+        issues_df = results["issues_df"].copy()
+        if not show_non_errors:
+            issues_df = issues_df[issues_df["Severity"] == "Error"].copy()
+        issues_df["Severity Sort"] = issues_df["Severity"].map(severity_order).fillna(99)
+        issues_df = issues_df.sort_values(["Severity Sort", "File", "Row", "Category"], kind="stable")
+        issues_df["Severity"] = issues_df["Severity"].apply(format_severity_label)
+        issues_df = issues_df.drop(columns=["Severity Sort"])
+        st.dataframe(issues_df, use_container_width=True, hide_index=True)
     else:
         st.success("No QC issues found.")
 
@@ -846,9 +985,39 @@ def render_qc_results(results):
 def render_merge_results(results, prefix):
     final_df = ensure_columns_and_order(results["expanded_df"], FINAL_COLS)
 
+    if results.get("sample_id_changed_count", 0) > 0:
+        st.info(
+            f"Sample_ID cleanup: removed non-alphanumeric characters in **{results['sample_id_changed_count']}** row(s) during File Merge."
+        )
+
+    if results.get("sample_id_collision_files"):
+        files_str = ", ".join(results["sample_id_collision_files"])
+        if results.get("sample_id_autocorrect_applied"):
+            st.warning(
+                f"⚠️Duplicate cleaned Sample_ID values were detected in: {files_str}. Auto-correction was applied to keep Sample_ID values unique."
+            )
+        else:
+            st.warning(
+                f"⚠️Duplicate cleaned Sample_ID values were detected in: {files_str}. Turn on 'Auto-correct duplicate cleaned Sample_IDs' to make them unique before export."
+            )
+
+    cleanup_df = results.get("sample_id_cleanup_df", pd.DataFrame())
+    if cleanup_df is not None and not cleanup_df.empty:
+        st.subheader("Sample_ID Cleanup Preview")
+        st.dataframe(cleanup_df, use_container_width=True, hide_index=True)
+
+    collision_df = results.get("sample_id_collision_df", pd.DataFrame())
+    if collision_df is not None and not collision_df.empty:
+        st.subheader("Duplicate Cleaned Sample_ID Auto-corrections")
+        st.dataframe(collision_df, use_container_width=True, hide_index=True)
+
     grna_totals = results["grna_qc_totals"]
     if grna_totals["missing_grna"] > 0:
-        st.warning(f"⚠️Found **{grna_totals['missing_grna']}** row(s) with missing gRNA. gRNA is required for CRISPResso.")
+        examples = ", ".join(grna_totals.get("missing_examples", []))
+        msg = f"⚠️Found **{grna_totals['missing_grna']}** row(s) with missing gRNA. gRNA is required for CRISPResso."
+        if examples:
+            msg += f" Examples: {examples}"
+        st.warning(msg)
     if grna_totals["u_to_t"] > 0:
         st.info(f"gRNA cleanup: Converted **{grna_totals['u_to_t']}** entries from U→T (case-insensitive).")
     if grna_totals["invalid_after"] > 0:
@@ -973,7 +1142,7 @@ if run_clicked:
         state.qc_results = run_qc(uploaded_files)
         state.merge_results = None
     else:
-        state.merge_results = run_merge(uploaded_files)
+        state.merge_results = run_merge(uploaded_files, auto_correct_sample_ids=state.merge_sample_id_autocorrect)
         state.qc_results = None
 
 if mode == "QC Screening" and state.qc_results is not None:
