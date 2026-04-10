@@ -123,7 +123,7 @@ def blankify_minimal(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     df = df.where(pd.notna(df), "")
-    return df.applymap(clean_cell_minimal)
+    return df.map(clean_cell_minimal)
 
 
 def clean_cell_merge(value) -> str:
@@ -139,7 +139,7 @@ def blankify_merge(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     df = df.where(pd.notna(df), "")
-    return df.applymap(clean_cell_merge)
+    return df.map(clean_cell_merge)
 
 
 def normalize_dna(value) -> str:
