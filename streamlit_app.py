@@ -116,7 +116,10 @@ def normalize_header_columns(df: pd.DataFrame) -> pd.DataFrame:
 def clean_cell_minimal(value) -> str:
     if value is None or pd.isna(value):
         return ""
-    return str(value).strip()
+    s = str(value).strip()
+    if s.lower() in {"nan", "none", "null", "0", "0.0"}:
+        return ""
+    return s
 
 
 def blankify_minimal(df: pd.DataFrame) -> pd.DataFrame:
@@ -130,7 +133,7 @@ def clean_cell_merge(value) -> str:
     if value is None or pd.isna(value):
         return ""
     s = str(value).strip()
-    if s.lower() in {"nan", "none", "null", "0"}:
+    if s.lower() in {"nan", "none", "null", "0", "0.0"}:
         return ""
     return s
 
