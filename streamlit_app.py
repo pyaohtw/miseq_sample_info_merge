@@ -67,6 +67,40 @@ prefix = st.text_input("Filename prefix (used for File Merge outputs)", value=de
 out_excel = f"{prefix}_sample_info.xlsx"
 out_csv = f"{prefix}_miseq.csv"
 
+state = st.session_state
+if "upload_key" not in state:
+    state.upload_key = 0
+for key in ("qc_results", "merge_results"):
+    if key not in state:
+        state[key] = None
+if "miseq_reads" not in state:
+    state.miseq_reads = 284
+if "miseq_reads_slider" not in state:
+    state.miseq_reads_slider = 284
+if "miseq_reads_input" not in state:
+    state.miseq_reads_input = 284
+
+
+def sync_miseq_reads_from_slider():
+    value = int(st.session_state.miseq_reads_slider)
+    st.session_state.miseq_reads = value
+    st.session_state.miseq_reads_input = value
+
+
+
+def sync_miseq_reads_from_input():
+    value = int(st.session_state.miseq_reads_input)
+    st.session_state.miseq_reads = value
+    st.session_state.miseq_reads_slider = value
+
+
+
+def reset_miseq_reads():
+    st.session_state.miseq_reads = 284
+    st.session_state.miseq_reads_slider = 284
+    st.session_state.miseq_reads_input = 284
+
+
 auto_fix_sample_id_dups = False
 if mode == "File Merge":
     auto_fix_sample_id_dups = st.checkbox(
@@ -78,13 +112,31 @@ if mode == "File Merge":
             "the duplicate number is inserted before that suffix; otherwise the number is appended at the end."
         ),
     )
-
-state = st.session_state
-if "upload_key" not in state:
-    state.upload_key = 0
-for key in ("qc_results", "merge_results"):
-    if key not in state:
-        state[key] = None
+    slider_col, input_col, reset_col = st.columns([3, 1.2, 1])
+    with slider_col:
+        st.slider(
+            "MiSeq read length (single-end)",
+            min_value=25,
+            max_value=300,
+            value=int(state.miseq_reads_slider),
+            key="miseq_reads_slider",
+            on_change=sync_miseq_reads_from_slider,
+            help="Value written under [Reads] in the MiSeq CSV.",
+        )
+    with input_col:
+        st.number_input(
+            "Manual input",
+            min_value=25,
+            max_value=300,
+            value=int(state.miseq_reads_input),
+            step=1,
+            key="miseq_reads_input",
+            on_change=sync_miseq_reads_from_input,
+        )
+    with reset_col:
+        st.write("")
+        st.write("")
+        st.button("Set to 284", on_click=reset_miseq_reads)
 
 col1, col2, _ = st.columns([1, 1, 4])
 with col1:
@@ -1105,7 +1157,7 @@ def render_merge_results(results, prefix):
     csv_buf.write(f"Experiment Name,{prefix}\n")
     csv_buf.write(f"Date,{today.month}/{today.day}/{today.year}\n")
     csv_buf.write("Workflow,GenerateFASTQ\n")
-    csv_buf.write("[Reads]\n300\n")
+    csv_buf.write(f"[Reads]\n{int(st.session_state.get('miseq_reads', 284))}\n")
     csv_buf.write("[Settings]\n")
     csv_buf.write("[Data]\n")
     csv_buf.write("Sample_ID,Sample_Name,I7_Index_ID,index,I5_INDEX_ID,index2,Sample_Project,Description\n")
