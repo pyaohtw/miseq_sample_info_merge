@@ -118,7 +118,6 @@ if mode == "File Merge":
             "MiSeq read length (single-end)",
             min_value=25,
             max_value=300,
-            value=int(state.miseq_reads_slider),
             key="miseq_reads_slider",
             on_change=sync_miseq_reads_from_slider,
             help="Value written under [Reads] in the MiSeq CSV.",
@@ -128,7 +127,6 @@ if mode == "File Merge":
             "Manual input",
             min_value=25,
             max_value=300,
-            value=int(state.miseq_reads_input),
             step=1,
             key="miseq_reads_input",
             on_change=sync_miseq_reads_from_input,
@@ -293,6 +291,37 @@ def read_data_sheet(excel_file):
 
 def display_file_label(excel_file, idx: int) -> str:
     return f"{excel_file.name} [upload {idx + 1}]"
+
+
+def df_to_tsv(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "<empty>"
+    return df.to_csv(sep="\t", index=False)
+
+
+def preview_tsv(df: pd.DataFrame, n: int = 20) -> str:
+    if df is None or df.empty:
+        return "<empty>"
+    return df.head(n).to_csv(sep="\t", index=False)
+
+
+def render_tsv_preview(title: str, df: pd.DataFrame, max_rows: int = 20):
+    st.subheader(title)
+    if df is None or df.empty:
+        st.caption("No rows.")
+    else:
+        st.code(preview_tsv(df, n=max_rows), language="text")
+
+
+def render_tsv_download(label: str, df: pd.DataFrame, file_name: str):
+    if df is None or df.empty:
+        return
+    st.download_button(
+        label,
+        data=df_to_tsv(df).encode("utf-8"),
+        file_name=file_name,
+        mime="text/tab-separated-values",
+    )
 
 
 def is_effectively_blank_for_activity(value) -> bool:
@@ -982,19 +1011,20 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
 
 def render_qc_results(results):
     st.subheader("QC Summary")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Files Checked", results["files_checked"])
-    c2.metric("Rows Checked", results["rows_checked"])
-    c3.metric("Errors", results["error_count"], help="Errors must be corrected before the sheet is ready.")
-    c4.metric("Warnings", results["warning_count"], help="Warnings should be reviewed. They may or may not need correction.")
-    c5.metric("Info", results["info_count"], help="Info items are for awareness only and do not require correction.")
+    st.write(
+        f"Files Checked: {results['files_checked']} | "
+        f"Rows Checked: {results['rows_checked']} | "
+        f"Errors: {results['error_count']} | "
+        f"Warnings: {results['warning_count']} | "
+        f"Info: {results['info_count']}"
+    )
 
     if results["user_ids"]:
         st.info(f"Unique User IDs found: {', '.join(results['user_ids'])}")
 
     if not results["summary_df"].empty:
-        st.subheader("Per-file Status")
-        st.dataframe(results["summary_df"], use_container_width=True, hide_index=True)
+        render_tsv_preview("Per-file Status", results["summary_df"], max_rows=200)
+        render_tsv_download("Download per-file status TSV", results["summary_df"], "qc_per_file_status.tsv")
 
     if not results["issues_df"].empty:
         st.subheader("QC Issues")
@@ -1006,19 +1036,20 @@ def render_qc_results(results):
         issues_df = issues_df.sort_values(by=["_severity_sort", "File", "Row", "Category", "Message"], kind="stable")
         issues_df["Severity"] = issues_df["Severity"].map(SEVERITY_LABELS).fillna(issues_df["Severity"])
         issues_df = issues_df.drop(columns=["_severity_sort"])
-        st.dataframe(issues_df, use_container_width=True, hide_index=True)
+        st.code(preview_tsv(issues_df, n=200), language="text")
+        render_tsv_download("Download QC issues TSV", issues_df, "qc_issues.tsv")
     else:
         st.success("No QC issues found.")
 
     if not results["amplicon_df"].empty:
-        st.subheader("Unique Amplicon Length Summary")
         display_cols = ["File", "Amplicon Label", "Length", "Occurrence Count", "Sequence"]
-        st.dataframe(results["amplicon_df"][display_cols], use_container_width=True, hide_index=True)
+        amp_df = results["amplicon_df"][display_cols].copy()
+        render_tsv_preview("Unique Amplicon Length Summary", amp_df, max_rows=200)
+        render_tsv_download("Download amplicon summary TSV", amp_df, "qc_amplicon_summary.tsv")
 
     if not results["duplicate_df"].empty:
-        st.subheader("Duplicate Index/index2 Details")
-        st.dataframe(results["duplicate_df"], use_container_width=True, hide_index=True)
-
+        render_tsv_preview("Duplicate Index/index2 Details", results["duplicate_df"], max_rows=200)
+        render_tsv_download("Download duplicate details TSV", results["duplicate_df"], "qc_duplicate_details.tsv")
 
 def render_merge_results(results, prefix):
     final_df = ensure_columns_and_order(results["expanded_df"], FINAL_COLS)
@@ -1035,8 +1066,8 @@ def render_merge_results(results, prefix):
                 f"Enable the duplicate-cleanup option if you want the tool to auto-correct them."
             )
         if not results["sample_id_collision_preview_df"].empty:
-            st.subheader("Sample_ID Collision Preview")
-            st.dataframe(results["sample_id_collision_preview_df"], use_container_width=True, hide_index=True)
+            render_tsv_preview("Sample_ID Collision Preview", results["sample_id_collision_preview_df"], max_rows=200)
+            render_tsv_download("Download Sample_ID collision TSV", results["sample_id_collision_preview_df"], "sample_id_collisions.tsv")
 
     grna_totals = results["grna_qc_totals"]
     if grna_totals["missing_grna"] > 0:
@@ -1128,20 +1159,23 @@ def render_merge_results(results, prefix):
             f"Examples: {examples}"
         )
         with st.expander("Show removed rows for MiSeq-required fields"):
-            st.dataframe(results["removed_miseq_df"], use_container_width=True, hide_index=True)
+            st.code(preview_tsv(results["removed_miseq_df"], n=200), language="text")
+            render_tsv_download("Download removed MiSeq rows TSV", results["removed_miseq_df"], "removed_miseq_rows.tsv")
 
     if results["user_ids"]:
         st.info(f"Merged Unique User IDs: {', '.join(results['user_ids'])}")
 
-    st.subheader("Merge Log")
-    st.table(results["log_rows"])
+    render_tsv_preview("Merge Log", results["log_rows"], max_rows=200)
+    render_tsv_download("Download merge log TSV", results["log_rows"], "merge_log.tsv")
 
     if not results["grna_qc_logs"].empty:
         with st.expander("Show per-file gRNA QC details"):
-            st.table(results["grna_qc_logs"])
+            st.code(preview_tsv(results["grna_qc_logs"], n=200), language="text")
+            render_tsv_download("Download gRNA QC TSV", results["grna_qc_logs"], "grna_qc.tsv")
     if not results["base_edit_qc_logs"].empty:
         with st.expander("Show per-file Base Editing / Amplicon QC details"):
-            st.table(results["base_edit_qc_logs"])
+            st.code(preview_tsv(results["base_edit_qc_logs"], n=200), language="text")
+            render_tsv_download("Download base editing QC TSV", results["base_edit_qc_logs"], "base_edit_qc.tsv")
 
     excel_buf = BytesIO()
     write_excel_with_blanks(final_df, excel_buf, SHEET_NAME, results["user_ids"])
@@ -1172,8 +1206,9 @@ def render_merge_results(results, prefix):
         mime="text/csv",
     )
 
-    st.subheader("Merged Data Preview")
-    st.dataframe(final_df, use_container_width=True)
+    render_tsv_preview("Merged Data Preview", final_df, max_rows=200)
+    render_tsv_download("Download merged data TSV", final_df, f"{prefix}_merged_data.tsv")
+
 
 
 if run_clicked:
