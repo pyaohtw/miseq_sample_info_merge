@@ -82,16 +82,20 @@ if "miseq_reads_input" not in state:
 
 
 def sync_miseq_reads_from_slider():
-    value = int(st.session_state.miseq_reads_slider)
+    value = int(st.session_state.miseq_reads_slider_widget)
     st.session_state.miseq_reads = value
+    st.session_state.miseq_reads_slider = value
     st.session_state.miseq_reads_input = value
+    st.session_state.miseq_reads_input_widget = value
 
 
 
 def sync_miseq_reads_from_input():
-    value = int(st.session_state.miseq_reads_input)
+    value = int(st.session_state.miseq_reads_input_widget)
     st.session_state.miseq_reads = value
+    st.session_state.miseq_reads_input = value
     st.session_state.miseq_reads_slider = value
+    st.session_state.miseq_reads_slider_widget = value
 
 
 
@@ -99,6 +103,8 @@ def reset_miseq_reads():
     st.session_state.miseq_reads = 284
     st.session_state.miseq_reads_slider = 284
     st.session_state.miseq_reads_input = 284
+    st.session_state.miseq_reads_slider_widget = 284
+    st.session_state.miseq_reads_input_widget = 284
 
 
 auto_fix_sample_id_dups = False
@@ -114,21 +120,25 @@ if mode == "File Merge":
     )
     slider_col, input_col, reset_col = st.columns([3, 1.2, 1])
     with slider_col:
+        if "miseq_reads_slider_widget" not in st.session_state:
+            st.session_state.miseq_reads_slider_widget = int(st.session_state.get("miseq_reads", 284))
         st.slider(
             "MiSeq read length (single-end)",
             min_value=25,
             max_value=300,
-            key="miseq_reads_slider",
+            key="miseq_reads_slider_widget",
             on_change=sync_miseq_reads_from_slider,
             help="Value written under [Reads] in the MiSeq CSV.",
         )
     with input_col:
+        if "miseq_reads_input_widget" not in st.session_state:
+            st.session_state.miseq_reads_input_widget = int(st.session_state.get("miseq_reads", 284))
         st.number_input(
             "Manual input",
             min_value=25,
             max_value=300,
             step=1,
-            key="miseq_reads_input",
+            key="miseq_reads_input_widget",
             on_change=sync_miseq_reads_from_input,
         )
     with reset_col:
