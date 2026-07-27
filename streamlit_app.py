@@ -13,18 +13,20 @@ SHEET_NAME = "Data"
 USER_ID_SHEET = "UserID"
 CORE_COLS = ["Sample_ID", "I7_Index_ID", "index", "I5_Index_ID", "index2", "Amplicon", "gRNA"]
 MISEQ_REQUIRED_COLS = ["Sample_ID", "I7_Index_ID", "index", "I5_Index_ID", "index2"]
-TEXT_BLANK_COLS = ["ELN_ID", "Isoform_Sample_ID", "PAM", "Base_Editing_Type"]
+TEXT_BLANK_COLS = ["ELN_ID", "Isoform_Sample_ID", "PAM", "Base_Editing_Type", "BE_Q30_cutoff"]
 FINAL_COLS = [
     "Sample_ID", "Sample_Name", "I7_Index_ID", "index", "I5_Index_ID", "index2",
     "Sample_Project", "Description", "ELN_ID", "Isoform_Sample_ID", "PAM",
     "gRNA", "Amplicon", "Exon",
     "Expected_HDR_Amplicon", "Quantification_Window_Coordinates",
-    "Quantification_Window_Center", "Plot_Window_Size", "ngRNA", "Base_Editing_Type"
+    "Quantification_Window_Center", "Plot_Window_Size", "ngRNA", "Base_Editing_Type", "BE_Q30_cutoff"
 ]
 NGRNA_RAW_HEADERS = ["ngRNA\n(nicking RNA)", "ngRNA (nicking RNA)"]
 NGRNA_FINAL_HEADER = "ngRNA"
 BASE_EDITING_COL = "Base_Editing_Type"
+BE_Q30_CUTOFF_COL = "BE_Q30_cutoff"
 VALID_BASE_EDITING_TYPES = {"ABE", "CBE", "BOTH"}
+VALID_BE_Q30_CUTOFF_VALUES = {"ON", "OFF"}
 BASE_EDITING_CONFLICT_COLS = [
     "Expected_HDR_Amplicon",
     "Quantification_Window_Coordinates",
@@ -217,6 +219,11 @@ def normalize_grna_for_merge(value) -> str:
 
 
 def normalize_base_editing_type(value) -> str:
+    s = clean_cell_minimal(value)
+    return s.upper() if s else ""
+
+
+def normalize_be_q30_cutoff(value) -> str:
     s = clean_cell_minimal(value)
     return s.upper() if s else ""
 
@@ -725,6 +732,8 @@ def apply_base_editing_rules_merge(df: pd.DataFrame):
     df_out = df.copy()
     if BASE_EDITING_COL not in df_out.columns:
         df_out[BASE_EDITING_COL] = ""
+    if BE_Q30_CUTOFF_COL not in df_out.columns:
+        df_out[BE_Q30_CUTOFF_COL] = ""
     df_out[BASE_EDITING_COL] = df_out[BASE_EDITING_COL].apply(lambda x: normalize_base_editing_type(clean_cell_merge(x)))
 
     amp_invalid_examples = []
@@ -732,6 +741,7 @@ def apply_base_editing_rules_merge(df: pd.DataFrame):
     grna_not_found_examples = []
     base_edit_invalid_examples = []
     base_edit_conflict_examples = []
+    be_q30_invalid_examples = []
     reoriented_examples = []
 
     amp_invalid_count = 0
@@ -739,6 +749,7 @@ def apply_base_editing_rules_merge(df: pd.DataFrame):
     grna_not_found_count = 0
     base_edit_invalid_count = 0
     base_edit_conflict_count = 0
+    be_q30_invalid_count = 0
     reoriented_count = 0
 
     for idx, row in df_out.iterrows():
@@ -750,6 +761,8 @@ def apply_base_editing_rules_merge(df: pd.DataFrame):
         hdr_amp_raw = clean_cell_merge(row.get("Expected_HDR_Amplicon", ""))
         hdr_amp_norm = hdr_amp_raw.upper() if hdr_amp_raw else ""
         bet = normalize_base_editing_type(row.get(BASE_EDITING_COL, ""))
+        be_q30_raw = clean_cell_merge(row.get(BE_Q30_CUTOFF_COL, ""))
+        be_q30_norm = normalize_be_q30_cutoff(be_q30_raw)
 
         if amp_norm and not DNA_ONLY_RE.fullmatch(amp_norm):
             amp_invalid_count += 1
@@ -790,6 +803,17 @@ def apply_base_editing_rules_merge(df: pd.DataFrame):
                     if len(base_edit_conflict_examples) < 5:
                         base_edit_conflict_examples.append(sample_id)
 
+        if be_q30_norm:
+            if be_q30_norm not in VALID_BE_Q30_CUTOFF_VALUES:
+                be_q30_invalid_count += 1
+                df_out.at[idx, BE_Q30_CUTOFF_COL] = ""
+                if len(be_q30_invalid_examples) < 5:
+                    be_q30_invalid_examples.append(f"{sample_id}: {be_q30_raw}")
+            else:
+                df_out.at[idx, BE_Q30_CUTOFF_COL] = be_q30_norm
+        else:
+            df_out.at[idx, BE_Q30_CUTOFF_COL] = ""
+
     return blankify_merge(df_out), {
         "amp_invalid": amp_invalid_count,
         "amp_invalid_examples": amp_invalid_examples,
@@ -801,6 +825,8 @@ def apply_base_editing_rules_merge(df: pd.DataFrame):
         "base_edit_invalid_examples": base_edit_invalid_examples,
         "base_edit_conflict": base_edit_conflict_count,
         "base_edit_conflict_examples": base_edit_conflict_examples,
+        "be_q30_invalid": be_q30_invalid_count,
+        "be_q30_invalid_examples": be_q30_invalid_examples,
         "amplicon_reoriented": reoriented_count,
         "amplicon_reoriented_examples": reoriented_examples,
     }
@@ -844,12 +870,14 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
     total_grna_not_found = 0
     total_base_edit_invalid = 0
     total_base_edit_conflict = 0
+    total_be_q30_invalid = 0
     total_amplicon_reoriented = 0
     total_amp_invalid_examples = set()
     total_hdr_invalid_examples = set()
     total_grna_not_found_examples = set()
     total_base_edit_invalid_examples = set()
     total_base_edit_conflict_examples = set()
+    total_be_q30_invalid_examples = set()
     total_amplicon_reoriented_examples = set()
     sample_id_cleanup_changed_count = 0
     sample_id_collision_row_count = 0
@@ -866,7 +894,7 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
                 "gRNA U→T": 0, "Non-ATCG (post U→T)": 0,
                 "Amplicon Non-ATCG": 0, "Expected_HDR_Amplicon Non-ATCG": 0,
                 "gRNA Not Found in Amplicon": 0, "Invalid Base_Editing_Type": 0,
-                "Base Editing Conflicts": 0, "Amplicons Reoriented": 0,
+                "Base Editing Conflicts": 0, "Invalid BE_Q30_cutoff": 0, "Amplicons Reoriented": 0,
             })
             continue
 
@@ -874,6 +902,8 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
         df = normalize_header_columns(blankify_merge(df_data))
         if BASE_EDITING_COL not in df.columns:
             df[BASE_EDITING_COL] = ""
+        if BE_Q30_CUTOFF_COL not in df.columns:
+            df[BE_Q30_CUTOFF_COL] = ""
         if "Exon" not in df.columns:
             df["Exon"] = ""
         if "Expected_HDR_Amplicon" not in df.columns:
@@ -928,6 +958,8 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
         total_base_edit_invalid_examples.update(qc_be["base_edit_invalid_examples"])
         total_base_edit_conflict += qc_be["base_edit_conflict"]
         total_base_edit_conflict_examples.update(qc_be["base_edit_conflict_examples"])
+        total_be_q30_invalid += qc_be["be_q30_invalid"]
+        total_be_q30_invalid_examples.update(qc_be["be_q30_invalid_examples"])
         total_amplicon_reoriented += qc_be["amplicon_reoriented"]
         total_amplicon_reoriented_examples.update(qc_be["amplicon_reoriented_examples"])
 
@@ -945,6 +977,7 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
             "gRNA Not Found in Amplicon": qc_be["grna_not_found"],
             "Invalid Base_Editing_Type": qc_be["base_edit_invalid"],
             "Base Editing Conflicts": qc_be["base_edit_conflict"],
+            "Invalid BE_Q30_cutoff": qc_be["be_q30_invalid"],
             "Amplicons Reoriented": qc_be["amplicon_reoriented"],
         })
         logs.append({
@@ -956,6 +989,7 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
             "gRNA Not Found in Amplicon": qc_be["grna_not_found"],
             "Invalid Base_Editing_Type": qc_be["base_edit_invalid"],
             "Base Editing Conflicts": qc_be["base_edit_conflict"],
+            "Invalid BE_Q30_cutoff": qc_be["be_q30_invalid"],
             "Amplicons Reoriented": qc_be["amplicon_reoriented"],
         })
 
@@ -1006,6 +1040,8 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
             "base_edit_invalid_examples": sorted(list(total_base_edit_invalid_examples))[:5],
             "base_edit_conflict": total_base_edit_conflict,
             "base_edit_conflict_examples": sorted(list(total_base_edit_conflict_examples))[:5],
+            "be_q30_invalid": total_be_q30_invalid,
+            "be_q30_invalid_examples": sorted(list(total_be_q30_invalid_examples))[:5],
             "amplicon_reoriented": total_amplicon_reoriented,
             "amplicon_reoriented_examples": sorted(list(total_amplicon_reoriented_examples))[:5],
         },
@@ -1123,6 +1159,12 @@ def render_merge_results(results, prefix):
     if be_totals["base_edit_conflict"] > 0:
         examples = ", ".join(be_totals["base_edit_conflict_examples"])
         msg = f"⚠️Found **{be_totals['base_edit_conflict']}** base-editing row(s) that also contain HDR/window/ngRNA fields."
+        if examples:
+            msg += f" Examples: {examples}"
+        st.warning(msg)
+    if be_totals["be_q30_invalid"] > 0:
+        examples = ", ".join(be_totals["be_q30_invalid_examples"])
+        msg = f"⚠️Found **{be_totals['be_q30_invalid']}** row(s) with invalid BE_Q30_cutoff values. Allowed values are ON or OFF; invalid entries were cleared to blank."
         if examples:
             msg += f" Examples: {examples}"
         st.warning(msg)
