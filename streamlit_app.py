@@ -69,6 +69,16 @@ prefix = st.text_input("Filename prefix (used for File Merge outputs)", value=de
 out_excel = f"{prefix}_sample_info.xlsx"
 out_csv = f"{prefix}_miseq.csv"
 
+show_results_as_table = st.checkbox(
+    "Display results as interactive table (unchecked = code/text view)",
+    value=False,
+    key="display_as_table",
+    help=(
+        "Master switch for all result previews. When on, every table below renders as an "
+        "interactive dataframe; when off (default), they render as plain code/text blocks."
+    ),
+)
+
 state = st.session_state
 if "upload_key" not in state:
     state.upload_key = 0
@@ -113,11 +123,12 @@ auto_fix_sample_id_dups = False
 if mode == "File Merge":
     auto_fix_sample_id_dups = st.checkbox(
         "Auto-correct duplicate cleaned Sample_IDs",
-        value=False,
+        value=True,
         help=(
-            "When enabled, duplicate Sample_ID values created or exposed after removing non-alphanumeric "
-            "characters will be auto-corrected. If a well-like suffix such as A1 or H12 is present at the end, "
-            "the duplicate number is inserted before that suffix; otherwise the number is appended at the end."
+            "When enabled, duplicate Sample_ID values (after removing non-alphanumeric characters) are "
+            "detected across ALL uploaded files pooled together, then auto-corrected. The first occurrence "
+            "keeps its ID; each later duplicate gets an underscore and occurrence number appended at the "
+            "end (e.g. AD1G12, AD1G12_2, AD1G12_3)."
         ),
     )
     slider_col, input_col, reset_col = st.columns([3, 1.2, 1])
@@ -322,12 +333,19 @@ def preview_tsv(df: pd.DataFrame, n: int = 20) -> str:
     return df.head(n).to_csv(sep="\t", index=False)
 
 
-def render_tsv_preview(title: str, df: pd.DataFrame, max_rows: int = 20):
-    st.subheader(title)
+def render_result_df(df: pd.DataFrame, max_rows: int = 20):
     if df is None or df.empty:
         st.caption("No rows.")
+        return
+    if st.session_state.get("display_as_table", False):
+        st.dataframe(df.head(max_rows), width="stretch", hide_index=True)
     else:
         st.code(preview_tsv(df, n=max_rows), language="text")
+
+
+def render_tsv_preview(title: str, df: pd.DataFrame, max_rows: int = 20):
+    st.subheader(title)
+    render_result_df(df, max_rows=max_rows)
 
 
 def render_tsv_download(label: str, df: pd.DataFrame, file_name: str):
@@ -643,12 +661,7 @@ def clean_sample_id(value) -> str:
 def make_unique_sample_id(base_id: str, occurrence_num: int) -> str:
     if occurrence_num <= 1 or base_id == "":
         return base_id
-    match = WELL_SUFFIX_RE.search(base_id)
-    if match:
-        suffix = match.group(1)
-        prefix = base_id[: -len(suffix)]
-        return f"{prefix}{occurrence_num}{suffix}"
-    return f"{base_id}{occurrence_num}"
+    return f"{base_id}_{occurrence_num}"
 
 
 def apply_sample_id_cleanup_and_duplicates(df: pd.DataFrame, auto_fix_duplicates: bool):
@@ -924,13 +937,6 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
             mask = df[relevant_cols].apply(lambda r: any(clean_cell_merge(v) != "" for v in r), axis=1)
         df_nonblank = blankify_merge(df[mask].copy())
 
-        df_nonblank, sample_id_meta = apply_sample_id_cleanup_and_duplicates(df_nonblank, auto_fix_duplicates)
-        sample_id_cleanup_changed_count += sample_id_meta["cleanup_changed_count"]
-        sample_id_collision_row_count += sample_id_meta["collision_row_count"]
-        sample_id_auto_fix_applied = sample_id_auto_fix_applied or sample_id_meta["auto_fix_applied"]
-        if not sample_id_meta["collision_preview_df"].empty:
-            sample_id_preview_rows.append(sample_id_meta["collision_preview_df"])
-
         df_nonblank, qc = clean_and_qc_grna_merge(df_nonblank)
         raw_list.append(df_nonblank.copy())
 
@@ -1000,6 +1006,14 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
     raw_df = blankify_merge(pd.concat(raw_list, ignore_index=True)) if raw_list else pd.DataFrame(columns=FINAL_COLS)
     expanded_df = blankify_merge(pd.concat(exp_list, ignore_index=True)) if exp_list else pd.DataFrame(columns=FINAL_COLS)
 
+    # Sample_ID cleanup + duplicate resolution pooled across ALL uploaded files (global scope).
+    expanded_df, sample_id_meta = apply_sample_id_cleanup_and_duplicates(expanded_df, auto_fix_duplicates)
+    sample_id_cleanup_changed_count = sample_id_meta["cleanup_changed_count"]
+    sample_id_collision_row_count = sample_id_meta["collision_row_count"]
+    sample_id_auto_fix_applied = sample_id_meta["auto_fix_applied"]
+    if not raw_df.empty and "Sample_ID" in expanded_df.columns and len(raw_df) == len(expanded_df):
+        raw_df["Sample_ID"] = expanded_df["Sample_ID"].values
+
     valid_mask, removed_miseq_df = collect_removed_miseq_rows(expanded_df)
     output_df = blankify_merge(expanded_df.loc[valid_mask].copy()) if not expanded_df.empty else expanded_df.copy()
     raw_valid_df = blankify_merge(raw_df.loc[valid_mask].copy()) if not raw_df.empty else raw_df.copy()
@@ -1014,7 +1028,7 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
     else:
         log_rows = pd.DataFrame(columns=["File"])
 
-    collision_preview_df = pd.concat(sample_id_preview_rows, ignore_index=True) if sample_id_preview_rows else pd.DataFrame()
+    collision_preview_df = sample_id_meta["collision_preview_df"]
 
     return {
         "raw_df": raw_valid_df,
@@ -1082,7 +1096,7 @@ def render_qc_results(results):
         issues_df = issues_df.sort_values(by=["_severity_sort", "File", "Row", "Category", "Message"], kind="stable")
         issues_df["Severity"] = issues_df["Severity"].map(SEVERITY_LABELS).fillna(issues_df["Severity"])
         issues_df = issues_df.drop(columns=["_severity_sort"])
-        st.code(preview_tsv(issues_df, n=200), language="text")
+        render_result_df(issues_df, max_rows=200)
         render_tsv_download("Download QC issues TSV", issues_df, "qc_issues.tsv")
     else:
         st.success("No QC issues found.")
@@ -1211,7 +1225,7 @@ def render_merge_results(results, prefix):
             f"Examples: {examples}"
         )
         with st.expander("Show removed rows for MiSeq-required fields"):
-            st.code(preview_tsv(results["removed_miseq_df"], n=200), language="text")
+            render_result_df(results["removed_miseq_df"], max_rows=200)
             render_tsv_download("Download removed MiSeq rows TSV", results["removed_miseq_df"], "removed_miseq_rows.tsv")
 
     if results["user_ids"]:
@@ -1222,11 +1236,11 @@ def render_merge_results(results, prefix):
 
     if not results["grna_qc_logs"].empty:
         with st.expander("Show per-file gRNA QC details"):
-            st.code(preview_tsv(results["grna_qc_logs"], n=200), language="text")
+            render_result_df(results["grna_qc_logs"], max_rows=200)
             render_tsv_download("Download gRNA QC TSV", results["grna_qc_logs"], "grna_qc.tsv")
     if not results["base_edit_qc_logs"].empty:
         with st.expander("Show per-file Base Editing / Amplicon QC details"):
-            st.code(preview_tsv(results["base_edit_qc_logs"], n=200), language="text")
+            render_result_df(results["base_edit_qc_logs"], max_rows=200)
             render_tsv_download("Download base editing QC TSV", results["base_edit_qc_logs"], "base_edit_qc.tsv")
 
     excel_buf = BytesIO()
