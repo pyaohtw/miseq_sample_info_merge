@@ -34,6 +34,21 @@ BASE_EDITING_CONFLICT_COLS = [
     "Plot_Window_Size",
     NGRNA_FINAL_HEADER,
 ]
+# CRISPResso excludes the terminal 15 bp from the right side of the
+# quantification window.  The merge output therefore caps only the coordinate
+# end at the last eligible reference position; the coordinate start remains
+# allowed anywhere within the retained amplicon.
+CRISPRESSO_EXCLUDE_BP_FROM_RIGHT = 15
+# Keep a 2-bp safety margin when a symmetric plot window reaches either
+# boundary of the trimmed reference.  CRISPResso can reject an exact-boundary
+# case such as cut point 160 + plot window 55 == reference length 215.
+PLOT_WINDOW_SAFETY_MARGIN = 2
+# Defaults used only to assess rows for base-editing/cutting samples whose
+# quantification-window fields are intentionally blank.
+BLANK_WINDOW_QUANTIFICATION_CENTER = -10
+BLANK_WINDOW_PLOT_SIZE = 22
+# User-requested CRISPResso right-side exclusion used by this preflight check.
+BLANK_WINDOW_CRISPRESSO_EXCLUSION = 5
 DNA_ONLY_RE = re.compile(r"^[ATCG]*$")
 DNA_OR_U_RE = re.compile(r"^[ATCGU]*$")
 WELL_SUFFIX_RE = re.compile(r"([A-H](?:[1-9]|1[0-2]))$", re.IGNORECASE)
@@ -845,6 +860,279 @@ def apply_base_editing_rules_merge(df: pd.DataFrame):
     }
 
 
+
+def parse_quantification_coordinates(value):
+    """Parse an inclusive 0-based coordinate string such as ``123-230``."""
+    text = clean_cell_merge(value).replace("–", "-")
+    match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def find_guide_hit_for_merge(reference: str, guide: str):
+    """Return guide orientation and reference positions for merge-time calculations."""
+    reference_u = clean_cell_merge(reference).upper().replace("U", "T")
+    guide_u = normalize_grna_for_merge(guide)
+    if not reference_u or not guide_u:
+        return None
+
+    start = reference_u.find(guide_u)
+    if start >= 0:
+        return {
+            "strand": "+",
+            "start": start,
+            "end": start + len(guide_u) - 1,
+            "ref_5p": start,
+            "ref_3p": start + len(guide_u) - 1,
+        }
+
+    guide_rc = reverse_complement(guide_u)
+    start = reference_u.find(guide_rc)
+    if start >= 0:
+        return {
+            "strand": "-",
+            "start": start,
+            "end": start + len(guide_u) - 1,
+            "ref_5p": start + len(guide_u) - 1,
+            "ref_3p": start,
+        }
+    return None
+
+
+def blank_window_required_read_length_merge(peg_hit: dict, ref_len: int):
+    """Return the minimum safe read length for a blank-window row.
+
+    Blank quantification-window rows are treated as base-editing/cutting rows
+    for this preflight only. Their implicit CRISPResso center is -10 and their
+    implicit plotting half-window is 22. The signed center is converted to the
+    reference axis using the gRNA strand, then the requested exclusion and
+    manual safety margin are added exactly as specified by the user.
+    """
+    if not peg_hit:
+        return None
+
+    quant_center = BLANK_WINDOW_QUANTIFICATION_CENTER
+    if peg_hit["strand"] == "+":
+        absolute_center = int(peg_hit["ref_3p"] + quant_center)
+    else:
+        # A negative guide-relative offset moves toward increasing reference
+        # coordinates on the reverse strand.
+        absolute_center = int(peg_hit["ref_3p"] - quant_center)
+
+    required_read_length = int(
+        absolute_center
+        + BLANK_WINDOW_PLOT_SIZE
+        + BLANK_WINDOW_CRISPRESSO_EXCLUSION
+        + PLOT_WINDOW_SAFETY_MARGIN
+    )
+    return {
+        "required_read_length": required_read_length,
+        "absolute_center": absolute_center,
+        "plot_window_size": BLANK_WINDOW_PLOT_SIZE,
+        "quantification_window_center": quant_center,
+        "guide_strand": peg_hit["strand"],
+        "guide_3p": int(peg_hit["ref_3p"]),
+        "reference_length": int(ref_len),
+    }
+
+
+def signed_center_from_absolute_merge(center_position: int, peg_hit: dict, ng_hit: dict, fallback_center: int) -> int:
+    """Convert an absolute plotting center to CRISPResso's signed guide-relative offset."""
+    if ng_hit is not None and ng_hit["ref_5p"] != peg_hit["ref_5p"]:
+        direction = 1 if ng_hit["ref_5p"] > peg_hit["ref_5p"] else -1
+    elif fallback_center != 0:
+        strand_flip = 1 if peg_hit["strand"] == "+" else -1
+        direction = 1 if fallback_center * strand_flip > 0 else -1
+    else:
+        direction = 0
+
+    if direction == 0:
+        return 0
+    strand_flip = 1 if peg_hit["strand"] == "+" else -1
+    distance = abs(int(center_position) - peg_hit["ref_3p"])
+    return int(distance * direction * strand_flip)
+
+
+def recenter_plot_parameters_merge(
+    plot_window_size: int,
+    quant_center: int,
+    peg_hit: dict,
+    ng_hit: dict,
+    ref_len: int,
+):
+    """Keep or recenter a symmetric plot interval against the full [0, ref_len) reference."""
+    half = max(0, int(plot_window_size))
+    direction = 0
+    if ng_hit is not None and ng_hit["ref_5p"] != peg_hit["ref_5p"]:
+        direction = 1 if ng_hit["ref_5p"] > peg_hit["ref_5p"] else -1
+    elif quant_center != 0:
+        strand_flip = 1 if peg_hit["strand"] == "+" else -1
+        direction = 1 if quant_center * strand_flip > 0 else -1
+
+    original_center = int(peg_hit["ref_3p"] + direction * abs(int(quant_center)))
+    left = original_center - half
+    right = original_center + half
+
+    # Use strict interior bounds.  In particular, CRISPResso can reject an
+    # exact right-boundary case (e.g. 160 + 55 == ref_len == 215).
+    if left > 0 and right < ref_len:
+        return int(quant_center), int(plot_window_size), False, ""
+
+    clipped_left = max(0, left)
+    clipped_right = min(ref_len, right)
+    if clipped_left >= clipped_right:
+        new_center = max(0, min(original_center, max(0, ref_len - 1)))
+        new_half = 0
+    else:
+        new_center = (clipped_left + clipped_right) // 2
+        boundary_limited_half = min(
+            new_center - clipped_left,
+            clipped_right - new_center,
+        )
+        # Reduce the deduced boundary-limited half-window by 2 bp for safety.
+        new_half = max(0, boundary_limited_half - PLOT_WINDOW_SAFETY_MARGIN)
+
+    new_quant_center = signed_center_from_absolute_merge(
+        new_center, peg_hit, ng_hit, quant_center
+    )
+    message = (
+        f"Plot window [{left}, {right}) reached or exceeded full trimmed "
+        f"Amplicon bounds [0, {ref_len}); recentered at {new_center} and "
+        f"applied a {PLOT_WINDOW_SAFETY_MARGIN}-bp safety margin, changing "
+        f"Quantification_Window_Center to {new_quant_center} and "
+        f"Plot_Window_Size to {new_half}."
+    )
+    return int(new_quant_center), int(new_half), True, message
+
+
+def apply_read_length_rules_merge(df: pd.DataFrame, read_length: int):
+    """Apply read-length trimming and make CRISPResso windows safe for each row."""
+    df_out = df.copy()
+    read_length = max(0, int(read_length))
+    stats = {
+        "amplicon_trimmed": 0,
+        "amplicon_bases_removed": 0,
+        "hdr_trimmed": 0,
+        "exon_adjusted": 0,
+        "quant_coordinates_clamped": 0,
+        "plot_recentered": 0,
+        "plot_recenter_examples": [],
+        "blank_window_rows_checked": 0,
+        "blank_window_read_length_danger": 0,
+        "blank_window_danger_examples": [],
+        "grna_not_found_after_trim": 0,
+        "grna_not_found_after_trim_examples": [],
+    }
+
+    for idx, row in df_out.iterrows():
+        amp_raw = clean_cell_merge(row.get("Amplicon", ""))
+        hdr_raw = clean_cell_merge(row.get("Expected_HDR_Amplicon", ""))
+        amp_original = amp_raw
+        original_amp_len = len(amp_original)
+        trim_count = max(0, original_amp_len - read_length)
+        amp_trimmed = amp_original[:read_length] if trim_count else amp_original
+
+        if trim_count:
+            df_out.at[idx, "Amplicon"] = amp_trimmed
+            stats["amplicon_trimmed"] += 1
+            stats["amplicon_bases_removed"] += trim_count
+            if hdr_raw:
+                # Hard rule: Expected_HDR_Amplicon loses exactly the same number
+                # of 3' bases as Amplicon, independent of HDR edit type.
+                df_out.at[idx, "Expected_HDR_Amplicon"] = hdr_raw[:max(0, len(hdr_raw) - trim_count)]
+                stats["hdr_trimmed"] += 1
+
+            exon = clean_cell_merge(row.get("Exon", ""))
+            exon_start = amp_original.upper().find(exon.upper()) if exon else -1
+            if exon_start >= 0 and exon_start < len(amp_trimmed):
+                exon_end = exon_start + len(exon)
+                retained_exon = amp_original[exon_start:min(exon_end, len(amp_trimmed))]
+                if retained_exon != exon:
+                    df_out.at[idx, "Exon"] = retained_exon
+                    stats["exon_adjusted"] += 1
+            elif exon and exon in amp_original and len(amp_trimmed) <= exon_start:
+                df_out.at[idx, "Exon"] = ""
+                stats["exon_adjusted"] += 1
+
+        amp_for_match = clean_cell_merge(df_out.at[idx, "Amplicon"])
+        grna = normalize_grna_for_merge(row.get("gRNA", ""))
+        if grna and amp_for_match:
+            grna_rc = reverse_complement(grna)
+            if grna not in amp_for_match.upper() and grna_rc not in amp_for_match.upper():
+                stats["grna_not_found_after_trim"] += 1
+                if len(stats["grna_not_found_after_trim_examples"]) < 5:
+                    stats["grna_not_found_after_trim_examples"].append(
+                        clean_cell_merge(row.get("Sample_ID", "")) or f"row {int(row.get('_source_row', idx + 2))}"
+                    )
+
+        coords = parse_quantification_coordinates(row.get("Quantification_Window_Coordinates", ""))
+        if coords and amp_for_match:
+            start, end = coords
+            ref_len = len(amp_for_match)
+            new_start = max(0, min(start, ref_len - 1))
+            # Quantification_Window_Coordinates are inclusive and 0-based.
+            # Keep the start unchanged (apart from ordinary reference bounds),
+            # but exclude the final 15 reference bases from the end coordinate.
+            eligible_right = max(0, ref_len - CRISPRESSO_EXCLUDE_BP_FROM_RIGHT - 1)
+            new_end = max(new_start, min(end, eligible_right))
+            new_coords = f"{new_start}-{new_end}"
+            if new_coords != clean_cell_merge(row.get("Quantification_Window_Coordinates", "")):
+                df_out.at[idx, "Quantification_Window_Coordinates"] = new_coords
+                stats["quant_coordinates_clamped"] += 1
+
+        qcenter_text = clean_cell_merge(row.get("Quantification_Window_Center", ""))
+        plot_text = clean_cell_merge(row.get("Plot_Window_Size", ""))
+        peg_hit = find_guide_hit_for_merge(amp_original, grna)
+
+        # Base-editing and cutting rows intentionally leave all three window
+        # fields blank. Do not populate those fields here; instead, preflight
+        # the selected read length using the agreed implicit -10 / 22 values.
+        # The calculation is based on the original amplicon so a guide that is
+        # removed by 3' trimming can still be evaluated correctly.
+        blank_window_row = not qcenter_text and not plot_text and not clean_cell_merge(
+            row.get("Quantification_Window_Coordinates", "")
+        )
+        if blank_window_row:
+            stats["blank_window_rows_checked"] += 1
+            blank_check = blank_window_required_read_length_merge(peg_hit, original_amp_len)
+            if blank_check is not None:
+                effective_read_length = len(amp_for_match)
+                if effective_read_length < blank_check["required_read_length"]:
+                    stats["blank_window_read_length_danger"] += 1
+                    if len(stats["blank_window_danger_examples"]) < 5:
+                        sample = clean_cell_merge(row.get("Sample_ID", "")) or f"row {int(row.get('_source_row', idx + 2))}"
+                        stats["blank_window_danger_examples"].append(
+                            f"{sample}: read length {read_length} (effective {effective_read_length}) < "
+                            f"minimum {blank_check['required_read_length']}; "
+                            f"center {blank_check['absolute_center']}, "
+                            f"plot window {blank_check['plot_window_size']}, "
+                            f"gRNA {blank_check['guide_strand']} strand 3' end {blank_check['guide_3p']}"
+                        )
+            continue
+
+        try:
+            qcenter = int(float(qcenter_text))
+            plot_size = int(float(plot_text))
+        except (TypeError, ValueError):
+            continue
+
+        if not peg_hit or not amp_for_match:
+            continue
+        ng_hit = find_guide_hit_for_merge(amp_original, row.get(NGRNA_FINAL_HEADER, ""))
+        new_qcenter, new_plot_size, recentered, message = recenter_plot_parameters_merge(
+            plot_size, qcenter, peg_hit, ng_hit, len(amp_for_match)
+        )
+        if recentered:
+            df_out.at[idx, "Quantification_Window_Center"] = str(new_qcenter)
+            df_out.at[idx, "Plot_Window_Size"] = str(new_plot_size)
+            stats["plot_recentered"] += 1
+            if len(stats["plot_recenter_examples"]) < 5:
+                sample = clean_cell_merge(row.get("Sample_ID", "")) or f"row {int(row.get('_source_row', idx + 2))}"
+                stats["plot_recenter_examples"].append(f"{sample}: {message}")
+
+    return blankify_merge(df_out), stats
+
 def collect_removed_miseq_rows(df: pd.DataFrame):
     removed_records = []
     valid_mask = []
@@ -885,6 +1173,18 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
     total_base_edit_conflict = 0
     total_be_q30_invalid = 0
     total_amplicon_reoriented = 0
+    total_amplicon_trimmed = 0
+    total_amplicon_bases_removed = 0
+    total_hdr_trimmed = 0
+    total_exon_adjusted = 0
+    total_quant_coordinates_clamped = 0
+    total_plot_recentered = 0
+    total_plot_recenter_examples = []
+    total_blank_window_rows_checked = 0
+    total_blank_window_read_length_danger = 0
+    total_blank_window_danger_examples = []
+    total_grna_not_found_after_trim = 0
+    total_grna_not_found_after_trim_examples = []
     total_amp_invalid_examples = set()
     total_hdr_invalid_examples = set()
     total_grna_not_found_examples = set()
@@ -945,6 +1245,9 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
         in_dup_count = len(dup_details)
 
         df_processed, qc_be = apply_base_editing_rules_merge(df_nonblank)
+        df_processed, trim_qc = apply_read_length_rules_merge(
+            df_processed, int(st.session_state.get("miseq_reads", 284))
+        )
         exp_list.append(df_processed)
 
         total_u_to_t += qc["u_to_t"]
@@ -968,6 +1271,24 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
         total_be_q30_invalid_examples.update(qc_be["be_q30_invalid_examples"])
         total_amplicon_reoriented += qc_be["amplicon_reoriented"]
         total_amplicon_reoriented_examples.update(qc_be["amplicon_reoriented_examples"])
+        total_amplicon_trimmed += trim_qc["amplicon_trimmed"]
+        total_amplicon_bases_removed += trim_qc["amplicon_bases_removed"]
+        total_hdr_trimmed += trim_qc["hdr_trimmed"]
+        total_exon_adjusted += trim_qc["exon_adjusted"]
+        total_quant_coordinates_clamped += trim_qc["quant_coordinates_clamped"]
+        total_plot_recentered += trim_qc["plot_recentered"]
+        for example in trim_qc["plot_recenter_examples"]:
+            if example not in total_plot_recenter_examples and len(total_plot_recenter_examples) < 5:
+                total_plot_recenter_examples.append(example)
+        total_blank_window_rows_checked += trim_qc["blank_window_rows_checked"]
+        total_blank_window_read_length_danger += trim_qc["blank_window_read_length_danger"]
+        for example in trim_qc["blank_window_danger_examples"]:
+            if example not in total_blank_window_danger_examples and len(total_blank_window_danger_examples) < 5:
+                total_blank_window_danger_examples.append(example)
+        total_grna_not_found_after_trim += trim_qc["grna_not_found_after_trim"]
+        for example in trim_qc["grna_not_found_after_trim_examples"]:
+            if example not in total_grna_not_found_after_trim_examples and len(total_grna_not_found_after_trim_examples) < 5:
+                total_grna_not_found_after_trim_examples.append(example)
 
         grna_qc_logs.append({
             "File": file_label,
@@ -985,6 +1306,14 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
             "Base Editing Conflicts": qc_be["base_edit_conflict"],
             "Invalid BE_Q30_cutoff": qc_be["be_q30_invalid"],
             "Amplicons Reoriented": qc_be["amplicon_reoriented"],
+            "gRNA Not Found After Trimming": trim_qc["grna_not_found_after_trim"],
+            "Amplicons Trimmed": trim_qc["amplicon_trimmed"],
+            "HDR Amplicons Trimmed": trim_qc["hdr_trimmed"],
+            "Exons Adjusted": trim_qc["exon_adjusted"],
+            "Quantification Coordinates Clamped": trim_qc["quant_coordinates_clamped"],
+            "Plot Windows Recentered": trim_qc["plot_recentered"],
+            "Blank Window Rows Checked": trim_qc["blank_window_rows_checked"],
+            "Blank Window Read-Length Danger": trim_qc["blank_window_read_length_danger"],
         })
         logs.append({
             "File": file_label, "Sheet Found": True, "Input Samples": len(df_nonblank),
@@ -997,6 +1326,14 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
             "Base Editing Conflicts": qc_be["base_edit_conflict"],
             "Invalid BE_Q30_cutoff": qc_be["be_q30_invalid"],
             "Amplicons Reoriented": qc_be["amplicon_reoriented"],
+            "gRNA Not Found After Trimming": trim_qc["grna_not_found_after_trim"],
+            "Amplicons Trimmed": trim_qc["amplicon_trimmed"],
+            "HDR Amplicons Trimmed": trim_qc["hdr_trimmed"],
+            "Exons Adjusted": trim_qc["exon_adjusted"],
+            "Quantification Coordinates Clamped": trim_qc["quant_coordinates_clamped"],
+            "Plot Windows Recentered": trim_qc["plot_recentered"],
+            "Blank Window Rows Checked": trim_qc["blank_window_rows_checked"],
+            "Blank Window Read-Length Danger": trim_qc["blank_window_read_length_danger"],
         })
 
     cross_dup = cross_file_duplicates(file_combos)
@@ -1058,6 +1395,18 @@ def run_merge(uploaded_files, auto_fix_duplicates=False):
             "be_q30_invalid_examples": sorted(list(total_be_q30_invalid_examples))[:5],
             "amplicon_reoriented": total_amplicon_reoriented,
             "amplicon_reoriented_examples": sorted(list(total_amplicon_reoriented_examples))[:5],
+            "amplicon_trimmed": total_amplicon_trimmed,
+            "amplicon_bases_removed": total_amplicon_bases_removed,
+            "hdr_trimmed": total_hdr_trimmed,
+            "exon_adjusted": total_exon_adjusted,
+            "quant_coordinates_clamped": total_quant_coordinates_clamped,
+            "plot_recentered": total_plot_recentered,
+            "plot_recenter_examples": total_plot_recenter_examples[:5],
+            "blank_window_rows_checked": total_blank_window_rows_checked,
+            "blank_window_read_length_danger": total_blank_window_read_length_danger,
+            "blank_window_danger_examples": total_blank_window_danger_examples[:5],
+            "grna_not_found_after_trim": total_grna_not_found_after_trim,
+            "grna_not_found_after_trim_examples": total_grna_not_found_after_trim_examples[:5],
         },
         "cross_dup_combos": cross_dup,
         "user_ids": sorted(user_ids),
@@ -1188,6 +1537,41 @@ def render_merge_results(results, prefix):
         if examples:
             msg += f" Examples: {examples}"
         st.info(msg)
+    if be_totals["amplicon_trimmed"] > 0:
+        st.info(
+            f"Read-length trimming: trimmed **{be_totals['amplicon_trimmed']}** Amplicon row(s), "
+            f"removing **{be_totals['amplicon_bases_removed']}** total 3′ bases; "
+            f"Expected_HDR_Amplicon was trimmed by the same per-row amount."
+        )
+    if be_totals["exon_adjusted"] > 0:
+        st.info(f"Adjusted **{be_totals['exon_adjusted']}** Exon value(s) to remain within the retained Amplicon sequence.")
+    if be_totals["quant_coordinates_clamped"] > 0:
+        st.info(f"Clamped **{be_totals['quant_coordinates_clamped']}** quantification coordinate range(s) to the retained Amplicon.")
+    if be_totals["plot_recentered"] > 0:
+        examples = "; ".join(be_totals["plot_recenter_examples"])
+        msg = f"Recentered **{be_totals['plot_recentered']}** plot window(s) against the full trimmed Amplicon [0, L)."
+        if examples:
+            msg += f" Examples: {examples}"
+        st.info(msg)
+    if be_totals["blank_window_read_length_danger"] > 0:
+        examples = "; ".join(be_totals["blank_window_danger_examples"])
+        msg = (
+            f"🚨 DANGER: **{be_totals['blank_window_read_length_danger']}** base-editing/cutting row(s) "
+            f"have blank quantification-window fields, but the selected read length is too short for "
+            f"the implicit center (-10), plot window (22), 5-bp CRISPResso exclusion, and "
+            f"{PLOT_WINDOW_SAFETY_MARGIN}-bp safety margin. The resulting CRISPResso plot may fail or omit "
+            f"part of the intended window."
+        )
+        if examples:
+            msg += f" Examples: {examples}"
+        st.error(msg)
+
+    if be_totals["grna_not_found_after_trim"] > 0:
+        examples = ", ".join(be_totals["grna_not_found_after_trim_examples"])
+        msg = f"⚠️After trimming, the full gRNA was not found in **{be_totals['grna_not_found_after_trim']}** Amplicon row(s)."
+        if examples:
+            msg += f" Examples: {examples}"
+        st.warning(msg)
 
     if not results["log_rows"].empty and "In-file Dup Combos" in results["log_rows"].columns:
         per_file_dup_df = results["log_rows"][results["log_rows"]["File"] != "Total"].copy()
